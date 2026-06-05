@@ -1,55 +1,87 @@
 # Remote as Host (rah)
 
-Make a host machine act as a remote dev box for coding agents (Claude Code, Codex).
-The agents run on the host; the real project — code, heavy datasets, GPU — lives on a
-remote. `rah` gives the agent two enforced planes:
+Make your local machine act as a remote dev box for coding agents (Claude Code, Codex).
+The agent runs locally; your real project — code, heavy datasets, GPU — stays on a remote.
+`rah` gives the agent two enforced planes:
 
 - **Files** are edited through a **same-path sshfs mount** of the remote code tree, so the
-  agent's native Read/Edit/Grep tools just work. Datasets are *not* mounted (they stay
+  agent's native read/edit/grep tools just work. Datasets are *not* mounted (they stay
   remote), so a stray search can't drag gigabytes over the network.
 - **Execution** is transparently routed to the remote over ssh by a `PreToolUse` **hook**
-  that rewrites every Bash command — deterministically, with no instructions to the model.
-  The agent feels like it is on the remote machine.
+  that rewrites the agent's shell commands — deterministically, with no instructions to the
+  model. The agent behaves as if it were on the remote machine.
 
-The routing is an *invariant enforced by a hook*, not a request in a prompt: the model
-cannot forget to run on the remote.
+Routing is an *invariant enforced by a hook*, not a request in a prompt — the model cannot
+forget to run on the remote. **Zero remote footprint:** only your machine installs `rah`; the
+remote needs nothing but a stock `sshd`, `bash`, and `base64`.
+
+## Install
+
+```bash
+# one line (re-run to upgrade)
+curl -fsSL https://raw.githubusercontent.com/Hiaa1/rah/main/install.sh | bash
+```
+
+Prefer to read before you run? Clone and install the single file:
+
+```bash
+git clone https://github.com/Hiaa1/rah && cd rah && ./install.sh
+```
+
+`rah` is a single self-contained Bash script — auditable in one file, and `scp`-able to any host.
 
 ## Quickstart
 
 ```bash
-./install.sh                                              # put `rah` on PATH
+rah doctor                                  # check dependencies + PATH
+rah init claude                             # wire the hook + skill (also: rah init codex)
 
 rah mount --prelude 'source .venv/bin/activate' \
-    user@hia-host:/home/hia/proj/.../explore_scannet      # mount the code tree (same path)
-
-rah init claude                                           # install hook + skill for Claude Code
-rah init codex                                            # install hook + skill for Codex
-
-rah status                                                # check mount + ssh health
+    you@host:/abs/path/to/project           # mount the remote code tree (same path)
 ```
 
-Then launch your agent from inside the mountpoint. Its file tools hit the mount; its Bash
-runs on the remote. Nothing else to configure.
+Then launch your agent from inside the mountpoint. Its file tools hit the mount; its commands
+run on the remote. Nothing else to configure. To remove everything later: `rah uninstall`.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `rah mount [--name N] [--prelude CMD] user@host:/abs/path` | mount remote code tree at the identical path |
+| `rah mount [--name N] [--prelude CMD] user@host:/abs/path` | mount a remote code tree at the identical path |
 | `rah unmount <name>` | unmount + drop the ssh master |
-| `rah run --cwd <dir> -- <cmd>` | execute a command on the remote (used by the hook) |
-| `rah hook` | PreToolUse rewrite, reads the event JSON on stdin |
-| `rah init <claude\|codex>` | install the hook + skill for an agent |
+| `rah init <claude\|codex> [--remove]` | install/remove the hook + skill for an agent |
 | `rah status` | mount / ssh-master health |
+| `rah doctor` | check dependencies, PATH, mount health |
+| `rah self-update` | update to the latest version |
+| `rah uninstall [--purge]` | remove hooks, skill, and the `rah` binary |
+| `rah run --cwd <dir> -- <cmd>` | run a command on the remote (used by the hook) |
 
 ## How it works
 
 ```
 agent file tools ──► same-path sshfs mount ──► remote code tree
-agent Bash ──► PreToolUse hook ──► rah run ──► ssh(ControlMaster) ──► remote: cd + prelude + cmd
+agent commands ──► PreToolUse hook ──► rah run ──► ssh(ControlMaster) ──► remote: cd + prelude + cmd
 ```
 
 The hook self-gates by working directory: outside a rah-managed mount it passes commands
-through unchanged, so it is safe even if installed globally. Commands are carried to the
-remote base64-encoded (no quoting/injection issues), and the remote exit code is propagated
-so the agent's run/verify loop works normally.
+through unchanged, so it is safe even if other projects share the same agent. Commands are
+carried to the remote base64-encoded (no quoting/injection issues), and the remote exit code is
+propagated so the agent's run/verify loop works normally. Standalone `cd` stays local so the
+shell's working directory is preserved across commands.
+
+## Requirements
+
+- **Local:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils` (`base64`),
+  `util-linux` (`mountpoint`); `curl` for install/self-update. Run `rah doctor` to check.
+- **Remote:** nothing beyond a standard OpenSSH server and a POSIX shell.
+
+## Security
+
+`rah` reroutes the agent's command execution to a remote host over ssh. By default the hook
+returns `permissionDecision: "defer"`, so it **respects your agent's normal approval flow**
+rather than auto-approving commands. Run fully autonomously only if you opt in
+(`rah hook --decision allow`). The whole tool is one readable Bash file; review it before install.
+
+## License
+
+[MIT](LICENSE)
