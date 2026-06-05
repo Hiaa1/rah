@@ -5,7 +5,7 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.1.0"
+RAH_VERSION="0.1.1"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
@@ -22,6 +22,13 @@ _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # Read one key from an env-style config file (no sourcing -> no code execution).
 _get() { sed -n "s/^$2=//p" "$1" | head -n1; }
+
+# Prompt the user via the terminal, even when stdin is a pipe (curl | bash).
+_prompt() {
+  local msg="$1" ans=""
+  if [ -r /dev/tty ]; then printf '%s' "$msg" >/dev/tty; IFS= read -r ans </dev/tty || true; fi
+  printf '%s' "$ans"
+}
 
 _list_configs() {
   [ -d "$RAH_CONFIG_DIR" ] || return 0
@@ -45,12 +52,32 @@ _config_for_cwd() {
   return 1
 }
 
+# Fast, timeout-guarded liveness probe. A dead fuse mount hangs on access, so this
+# must never run unguarded. Returns 0 if the path is reachable.
+_mount_alive() { timeout 2 stat "$1" >/dev/null 2>&1; }
+
+# Classify a mountpoint: mounted | dead | unmounted. `mountpoint -q` alone lies
+# (a dead fuse mount still reports as mounted), so combine it with a liveness probe.
+_mount_state() {
+  local mp="$1"
+  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+    _mount_alive "$mp" && echo mounted || echo dead
+  elif timeout 3 stat "$mp" >/dev/null 2>&1; then
+    echo unmounted
+  else
+    echo dead
+  fi
+}
+
+# Passwordless ssh reachability probe (BatchMode: never blocks on a password prompt).
+_ssh_ok() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" true 2>/dev/null; }
+
 # The skill document, emitted into each agent's skills dir by `rah init`.
 _skill_doc() {
   cat <<'RAHSKILL'
 ---
 name: rah
-description: Remote as Host — manage the sshfs mount and remote execution for this machine. Use when the user asks to mount/unmount a remote project, check mount or ssh health (rah status), or set up "remote as host" for a coding agent. Note that command execution in a rah-managed directory is ALREADY auto-routed to the remote by a hook — you do not need to add ssh yourself.
+description: Remote as Host — manage the sshfs mount and remote execution for this machine. Use when the user asks to mount/unmount a remote project, set up "remote as host", check mount/ssh health (rah status), or recover a broken mount. Note that command execution in a rah-managed directory is ALREADY auto-routed to the remote by a hook — you do not need to add ssh yourself.
 ---
 
 # rah — Remote as Host
@@ -63,17 +90,27 @@ already run on the remote (with its GPU, datasets, and environment).**
 
 ## When to use this skill
 
-Only for **control-plane** actions. Execution routing is automatic; never wrap commands
-in ssh manually.
+Only for **control-plane** actions: setting up, mounting, checking health, or recovering.
+Execution routing is automatic; never wrap commands in ssh manually.
 
 ## Commands
 
-- `rah status` — list managed mounts; show whether each is mounted and its ssh master is alive.
+- `rah setup [user@host:/abs/path]` — one-command onboarding: checks dependencies, wires the
+  installed agents, and mounts. When helping a user set this up, ask them **only** for the host
+  and the absolute remote path; everything else (agents, deps, env prelude) is auto-detected.
+- `rah status` — list managed mounts; show mounted / DEAD / not-mounted and ssh-master health.
 - `rah mount [--name N] [--prelude 'CMD'] user@host:/abs/path` — mount a remote code tree at the
   identical absolute path. `--prelude` is a shell snippet run before each remote command
   (e.g. `source .venv/bin/activate`) to fix the remote environment.
+- `rah remount [name]` — recover a dead/stale mount (re-establishes ssh + sshfs). No name = all.
 - `rah unmount <name>` — unmount and drop the ssh master connection.
 - `rah init <claude|codex>` — install the routing hook and this skill for an agent.
+
+## Recovery
+
+If file tools fail with `Transport endpoint is not connected` or hang, the mount has died. Run
+`rah remount` (it executes locally) and retry. Command execution over ssh keeps working even
+while the mount is down, since it is a separate channel.
 
 ## Notes
 
@@ -83,6 +120,28 @@ in ssh manually.
   executes on the remote.
 - `cd` within the mount works locally and is preserved across commands; everything else runs remote.
 RAHSKILL
+}
+
+# ---------- mount internals ----------
+
+# Ensure a persistent ssh master connection at $socket. Returns non-zero on failure.
+_ensure_master() {
+  local host="$1" socket="$2"
+  ssh -S "$socket" -O check "$host" 2>/dev/null && return 0
+  ssh -M -S "$socket" -o ControlPersist=600 -fN "$host"
+}
+
+# Mount remote_path at mp (same path). Re-establishes master, clears a stale mount,
+# and skips work if already healthy. Returns sshfs's status.
+_do_mount() {
+  local host="$1" remote_path="$2" mp="$3" socket="$4"
+  _ensure_master "$host" "$socket" || return 1
+  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+    _mount_alive "$mp" && return 0               # already mounted & healthy
+    fusermount -uz "$mp" 2>/dev/null || true     # stale -> clear before remount
+  fi
+  sshfs "$host:$remote_path" "$mp" \
+    -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath="$socket"
 }
 
 # ---------- mount ----------
@@ -112,18 +171,7 @@ cmd_mount() {
   sudo mkdir -p $mountpoint && sudo chown $USER: $mountpoint"
   fi
 
-  if ! ssh -S "$socket" -O check "$host" 2>/dev/null; then
-    ssh -M -S "$socket" -o ControlPersist=600 -fN "$host" \
-      || _die "failed to open ssh master to $host"
-  fi
-
-  if mountpoint -q "$mountpoint" 2>/dev/null; then
-    echo "rah: already mounted at $mountpoint"
-  else
-    sshfs "$host:$remote_path" "$mountpoint" \
-      -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath="$socket" \
-      || _die "sshfs mount failed"
-  fi
+  _do_mount "$host" "$remote_path" "$mountpoint" "$socket" || _die "mount failed (host $host)"
 
   local cfg="$RAH_CONFIG_DIR/$name.env"
   {
@@ -136,6 +184,28 @@ cmd_mount() {
   echo "rah: mounted $host:$remote_path at $mountpoint (config: $cfg)"
 }
 
+cmd_remount() {
+  local names=() cfg name host remote_path mp socket
+  if [ $# -gt 0 ]; then
+    names=("$@")
+  else
+    while IFS= read -r cfg; do [ -n "$cfg" ] && names+=("$(basename "$cfg" .env)"); done < <(_list_configs)
+  fi
+  [ "${#names[@]}" -gt 0 ] || _die "no managed mounts to remount"
+  for name in "${names[@]}"; do
+    cfg="$RAH_CONFIG_DIR/$name.env"
+    [ -f "$cfg" ] || { echo "rah: no such mount: $name" >&2; continue; }
+    host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
+    mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"
+    fusermount -uz "$mp" 2>/dev/null || true
+    if _do_mount "$host" "$remote_path" "$mp" "$socket"; then
+      echo "rah: remounted $name ($mp)"
+    else
+      echo "rah: remount failed for $name" >&2
+    fi
+  done
+}
+
 cmd_unmount() {
   local name="${1:-}"
   [ -n "$name" ] || _die "usage: rah unmount <name>"
@@ -143,8 +213,8 @@ cmd_unmount() {
   [ -f "$cfg" ] || _die "no such mount: $name"
   local mp host socket
   mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"
-  if mountpoint -q "$mp" 2>/dev/null; then
-    fusermount -u "$mp" || _die "fusermount failed for $mp"
+  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+    fusermount -uz "$mp" || _die "fusermount failed for $mp"
   fi
   ssh -S "$socket" -O exit "$host" 2>/dev/null || true
   echo "rah: unmounted $name"
@@ -179,6 +249,8 @@ cmd_run() {
   local host socket prelude
   host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; prelude="$(_get "$cfg" prelude)"
 
+  _ensure_master "$host" "$socket" 2>/dev/null || true   # self-heal a dead master
+
   local b64 pre=""
   b64="$(printf '%s' "$cmd" | base64 -w0)"
   [ -n "$prelude" ] && pre="{ $prelude; } && "
@@ -210,9 +282,27 @@ cmd_hook() {
   cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
   [ -n "$cwd" ] || cwd="$PWD"
 
-  local passthrough=0
-  _config_for_cwd "$cwd" >/dev/null 2>&1 || passthrough=1
+  local passthrough=0 cfg=""
+  cfg="$(_config_for_cwd "$cwd" 2>/dev/null)" || passthrough=1
   case "$cmd" in rah|"rah "*) passthrough=1 ;; esac
+
+  # Opportunistic, throttled, non-blocking mount self-heal (file plane only).
+  # Runs at most once per 10s; if the mount is dead, fire a detached remount and
+  # continue — the command still routes over ssh, which is independent of the mount.
+  if [ -n "$cfg" ]; then
+    local _name _stamp
+    _name="$(basename "$cfg" .env)"; _stamp="$RAH_CONFIG_DIR/.heal.$_name"
+    if [ -z "$(find "$_stamp" -newermt '-10 seconds' 2>/dev/null)" ]; then
+      : > "$_stamp" 2>/dev/null || true
+      if ! _mount_alive "$(_get "$cfg" mountpoint)"; then
+        if command -v setsid >/dev/null 2>&1; then
+          setsid "$(_self_path)" remount "$_name" </dev/null >/dev/null 2>&1 &
+        else
+          nohup "$(_self_path)" remount "$_name" </dev/null >/dev/null 2>&1 &
+        fi
+      fi
+    fi
+  fi
 
   # Pure navigation (standalone cd/pushd/popd, no chaining) -> keep local to
   # preserve the agent's persistent shell cwd.
@@ -253,6 +343,14 @@ _ensure_path() {
     *":$RAH_BIN_DIR:"*) ;;
     *) echo "rah: note — add $RAH_BIN_DIR to your PATH" ;;
   esac
+}
+
+# True if the rah hook is already registered in a JSON agent config file.
+_hook_present() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  jq -e '(.hooks.PreToolUse // []) | any(.[]; (.hooks // []) | any(.command == "rah hook"))' \
+    "$file" >/dev/null 2>&1
 }
 
 # Add our {matcher:"Bash", hooks:[{command:"rah hook"}]} group to .hooks.PreToolUse, idempotently.
@@ -310,6 +408,77 @@ cmd_init() {
   esac
 }
 
+# ---------- setup (one-command guided onboarding) ----------
+
+cmd_setup() {
+  local target="" prelude="" prelude_set=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prelude) prelude="$2"; prelude_set=1; shift 2 ;;
+      --*)       _die "unknown option: $1" ;;
+      *)         target="$1"; shift ;;
+    esac
+  done
+
+  echo "== rah setup =="
+  cmd_doctor            # exits with apt hints if a required dependency is missing
+  echo
+
+  # Wire whichever agents are installed (idempotent); note if a hook was newly added.
+  local a adir cfgfile newly=0
+  for a in claude codex; do
+    adir="$HOME/.$a"; [ -d "$adir" ] || continue
+    cfgfile="$adir/settings.json"; [ "$a" = codex ] && cfgfile="$adir/hooks.json"
+    _hook_present "$cfgfile" || newly=1
+    cmd_init "$a" >/dev/null
+    echo "agent: $a wired"
+  done
+
+  # Resolve the remote target (ask only for the irreducible input).
+  [ -n "$target" ] || target="$(_prompt 'remote to mount (user@host:/abs/path): ')"
+  [ -n "$target" ] || _die "no remote given"
+  case "$target" in *:/*) ;; *) _die "expected user@host:/abs/path, got: $target" ;; esac
+  local host="${target%%:*}" remote_path="${target#*:}"
+
+  # SSH preflight — rah needs passwordless ssh; fail loud with the one human step.
+  if ! _ssh_ok "$host"; then
+    echo "rah: passwordless ssh to '$host' isn't working yet. Authorize your key once:"
+    echo "    ssh-copy-id $host           # enter the remote password this one time"
+    echo "  (or add a Host alias in ~/.ssh/config: HostName / User / Port / IdentityFile)"
+    echo "  verify with: ssh $host true"
+    echo "then re-run: rah setup $target"
+    return 1
+  fi
+
+  # Same-path mountpoint — needs root once if it's outside your home.
+  if ! mkdir -p "$remote_path" 2>/dev/null; then
+    echo "rah: the mount path needs root to create once — run:"
+    echo "  sudo mkdir -p $remote_path && sudo chown $USER: $remote_path"
+    echo "then re-run: rah setup $target"
+    return 1
+  fi
+
+  # Best-effort prelude auto-probe.
+  if [ "$prelude_set" = 0 ]; then
+    local socket="$HOME/.ssh/cm-${host##*@}"
+    _ensure_master "$host" "$socket" 2>/dev/null || true
+    if ssh -S "$socket" "$host" "test -f $(_shq "$remote_path/.venv/bin/activate")" 2>/dev/null; then
+      prelude="source .venv/bin/activate"; echo "prelude: detected .venv -> '$prelude'"
+    fi
+  fi
+
+  # Mount.
+  if [ -n "$prelude" ]; then cmd_mount --prelude "$prelude" "$target"; else cmd_mount "$target"; fi
+
+  echo
+  if [ "$newly" = 1 ]; then
+    echo "rah: hook newly installed — restart your agent ONCE so it loads."
+    echo "     (future mounts activate immediately, no restart needed.)"
+  else
+    echo "rah: ready — routing is live now, no restart needed."
+  fi
+}
+
 # ---------- status / doctor ----------
 
 cmd_status() {
@@ -322,9 +491,13 @@ cmd_status() {
     printf '● %s\n' "$name"
     printf '  host:       %s\n' "$host"
     printf '  mountpoint: %s ' "$mp"
-    mountpoint -q "$mp" 2>/dev/null && printf '[mounted]\n' || printf '[NOT mounted]\n'
-    printf '  ssh master: '
-    ssh -S "$socket" -O check "$host" 2>/dev/null && printf '[alive]\n' || printf '[down]\n'
+    case "$(_mount_state "$mp")" in
+      mounted) printf '[mounted]\n' ;;
+      dead)    printf '[DEAD — run: rah remount %s]\n' "$name" ;;
+      *)       printf '[not mounted]\n' ;;
+    esac
+    printf '  ssh:        '
+    if _ssh_ok "$host"; then printf '[reachable]\n'; else printf '[NO passwordless ssh — run: ssh-copy-id %s]\n' "$host"; fi
   done < <(_list_configs)
   [ "$any" -eq 1 ] || echo "rah: no managed mounts (run: rah mount user@host:/abs/path)"
 }
@@ -349,6 +522,7 @@ cmd_doctor() {
   fi
   _check_dep jq         jq             1 || ok=0
   _check_dep base64     coreutils      1 || ok=0
+  _check_dep timeout    coreutils      1 || ok=0
   _check_dep mountpoint util-linux     1 || ok=0
   _check_dep curl       curl           0 || true
   printf '  %-12s ' PATH
@@ -402,7 +576,9 @@ _usage() {
   cat <<EOF
 rah — Remote as Host (v$RAH_VERSION)
 
+  rah setup [user@host:/abs/path] [--prelude CMD]            one-command guided onboarding
   rah mount [--name N] [--prelude CMD] user@host:/abs/path   mount remote code tree (same path)
+  rah remount [name]                                         recover a dead mount (all if no name)
   rah unmount <name>                                         unmount + drop ssh master
   rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
   rah hook [--decision defer|allow|ask]                      PreToolUse rewrite (reads JSON on stdin)
@@ -418,7 +594,9 @@ EOF
 main() {
   local sub="${1:-}"; [ $# -gt 0 ] && shift || true
   case "$sub" in
+    setup)       cmd_setup "$@" ;;
     mount)       cmd_mount "$@" ;;
+    remount)     cmd_remount "$@" ;;
     unmount)     cmd_unmount "$@" ;;
     run)         cmd_run "$@" ;;
     hook)        cmd_hook "$@" ;;
