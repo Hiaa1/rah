@@ -5,11 +5,13 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
+RAH_VERSION="0.1.0"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
+RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
+RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
+RAH_BIN_DIR="${RAH_BIN_DIR:-$HOME/.local/bin}"
 
 _self_path() { readlink -f "${BASH_SOURCE[0]}"; }
-RAH_ROOT="$(dirname "$(_self_path)")"
-SKILL_SRC="$RAH_ROOT/skills/rah/SKILL.md"
 
 # ---------- helpers ----------
 
@@ -41,6 +43,46 @@ _config_for_cwd() {
     esac
   done < <(_list_configs)
   return 1
+}
+
+# The skill document, emitted into each agent's skills dir by `rah init`.
+_skill_doc() {
+  cat <<'RAHSKILL'
+---
+name: rah
+description: Remote as Host — manage the sshfs mount and remote execution for this machine. Use when the user asks to mount/unmount a remote project, check mount or ssh health (rah status), or set up "remote as host" for a coding agent. Note that command execution in a rah-managed directory is ALREADY auto-routed to the remote by a hook — you do not need to add ssh yourself.
+---
+
+# rah — Remote as Host
+
+`rah` lets this host act as a remote dev box: files are edited through a same-path
+sshfs mount, while command execution is transparently routed to the remote over ssh
+by a `PreToolUse` hook. **You do not need to prefix commands with `ssh` or do anything
+special — when the working directory is a rah-managed mount, your normal Bash commands
+already run on the remote (with its GPU, datasets, and environment).**
+
+## When to use this skill
+
+Only for **control-plane** actions. Execution routing is automatic; never wrap commands
+in ssh manually.
+
+## Commands
+
+- `rah status` — list managed mounts; show whether each is mounted and its ssh master is alive.
+- `rah mount [--name N] [--prelude 'CMD'] user@host:/abs/path` — mount a remote code tree at the
+  identical absolute path. `--prelude` is a shell snippet run before each remote command
+  (e.g. `source .venv/bin/activate`) to fix the remote environment.
+- `rah unmount <name>` — unmount and drop the ssh master connection.
+- `rah init <claude|codex>` — install the routing hook and this skill for an agent.
+
+## Notes
+
+- Only the **code tree** is mounted; datasets/outputs stay on the remote and are reached
+  natively when commands execute there. Don't try to read large datasets through the mount.
+- If a command must inspect remote outputs/logs, just run `cat`/`ls`/`tail` normally — it
+  executes on the remote.
+- `cd` within the mount works locally and is preserved across commands; everything else runs remote.
+RAHSKILL
 }
 
 # ---------- mount ----------
@@ -153,6 +195,15 @@ cmd_run() {
 
 cmd_hook() {
   set +e
+  local decision="defer"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --decision) decision="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  case "$decision" in defer|allow|ask) ;; *) decision="defer" ;; esac
+
   local input cmd cwd
   input="$(cat)"
   cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
@@ -175,31 +226,36 @@ cmd_hook() {
   esac
 
   if [ "$passthrough" -eq 1 ] || [ -z "$cmd" ]; then
-    jq -nc '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow"}}'
+    jq -nc '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"defer"}}'
     return 0
   fi
 
-  local b64 newcmd
-  b64="$(printf '%s' "$cmd" | base64 -w0)"
-  newcmd="rah run --cwd $(_shq "$cwd") --b64 $b64"
-  jq -nc --arg c "$newcmd" \
-    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",updatedInput:{command:$c}}}'
+  # Readable rewrite for commands the agent's local shell passes through verbatim;
+  # fall back to base64 transport when shell metacharacters would be re-parsed.
+  local newcmd
+  case "$cmd" in
+    *[!A-Za-z0-9\ _.,=/+:@%-]*)
+      newcmd="rah run --cwd $(_shq "$cwd") --b64 $(printf '%s' "$cmd" | base64 -w0)" ;;
+    *)
+      newcmd="rah run --cwd $(_shq "$cwd") -- $cmd" ;;
+  esac
+  jq -nc --arg c "$newcmd" --arg d "$decision" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,updatedInput:{command:$c}}}'
 }
 
-# ---------- init (install hook + skill into an agent) ----------
+# ---------- init (install/remove hook + skill for an agent) ----------
 
 _ensure_path() {
-  mkdir -p "$HOME/.local/bin"
-  local self target="$HOME/.local/bin/rah"; self="$(_self_path)"
+  mkdir -p "$RAH_BIN_DIR"
+  local self target="$RAH_BIN_DIR/rah"; self="$(_self_path)"
   [ "$self" = "$target" ] || ln -sf "$self" "$target"
   case ":$PATH:" in
-    *":$HOME/.local/bin:"*) ;;
-    *) echo "rah: note — add ~/.local/bin to your PATH" ;;
+    *":$RAH_BIN_DIR:"*) ;;
+    *) echo "rah: note — add $RAH_BIN_DIR to your PATH" ;;
   esac
 }
 
-# Merge a {matcher:"Bash", hooks:[{type:command, command:"rah hook"}]} entry into
-# .hooks.PreToolUse of a JSON file, idempotently.
+# Add our {matcher:"Bash", hooks:[{command:"rah hook"}]} group to .hooks.PreToolUse, idempotently.
 _merge_hook_json() {
   local file="$1" tmp; tmp="$(mktemp)"
   [ -f "$file" ] || echo '{}' > "$file"
@@ -210,38 +266,51 @@ _merge_hook_json() {
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-_install_skill() {
-  local dir="$1"
-  [ -f "$SKILL_SRC" ] || _die "skill source missing: $SKILL_SRC"
-  mkdir -p "$dir"
-  cp "$SKILL_SRC" "$dir/SKILL.md"
+# Strip the rah hook entry from .hooks.PreToolUse, dropping any group left empty.
+_remove_hook_json() {
+  local file="$1" tmp
+  [ -f "$file" ] || return 0
+  tmp="$(mktemp)"
+  jq '
+    if (.hooks.PreToolUse | type) == "array" then
+      .hooks.PreToolUse |= ( map(.hooks |= map(select(.command != "rah hook")))
+                             | map(select((.hooks // [] | length) > 0)) )
+    else . end
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-_init_claude() {
-  _ensure_path
-  mkdir -p "$HOME/.claude"
-  _merge_hook_json "$HOME/.claude/settings.json"
-  _install_skill "$HOME/.claude/skills/rah"
-  echo "rah: claude hook + skill installed (~/.claude)"
-}
-
-_init_codex() {
-  _ensure_path
-  mkdir -p "$HOME/.codex"
-  _merge_hook_json "$HOME/.codex/hooks.json"
-  _install_skill "$HOME/.codex/skills/rah"
-  echo "rah: codex hook + skill installed (~/.codex)"
+_init_agent() {
+  local label="$1" home="$2" cfg="$3" skilldir="$4" remove="$5"
+  if [ "$remove" -eq 1 ]; then
+    _remove_hook_json "$cfg"
+    rm -rf "$skilldir"
+    echo "rah: removed $label hook + skill"
+  else
+    _ensure_path
+    mkdir -p "$home" "$skilldir"
+    _merge_hook_json "$cfg"
+    _skill_doc > "$skilldir/SKILL.md"
+    echo "rah: $label hook + skill installed ($home)"
+  fi
 }
 
 cmd_init() {
-  case "${1:-}" in
-    claude) _init_claude ;;
-    codex)  _init_codex ;;
-    *)      _die "usage: rah init <claude|codex>" ;;
+  local agent="" remove=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --remove)     remove=1; shift ;;
+      claude|codex) agent="$1"; shift ;;
+      *)            _die "usage: rah init <claude|codex> [--remove]" ;;
+    esac
+  done
+  case "$agent" in
+    claude) _init_agent "Claude" "$HOME/.claude" "$HOME/.claude/settings.json" "$HOME/.claude/skills/rah" "$remove" ;;
+    codex)  _init_agent "Codex"  "$HOME/.codex"  "$HOME/.codex/hooks.json"     "$HOME/.codex/skills/rah"  "$remove" ;;
+    *)      _die "usage: rah init <claude|codex> [--remove]" ;;
   esac
 }
 
-# ---------- status ----------
+# ---------- status / doctor ----------
 
 cmd_status() {
   local any=0 cfg name host mp socket
@@ -260,30 +329,105 @@ cmd_status() {
   [ "$any" -eq 1 ] || echo "rah: no managed mounts (run: rah mount user@host:/abs/path)"
 }
 
+_check_dep() {  # name pkg required(0|1) ; prints status, returns non-zero if missing
+  local bin="$1" pkg="$2" required="$3"
+  printf '  %-12s ' "$bin"
+  if command -v "$bin" >/dev/null 2>&1; then echo "[ok]"; return 0; fi
+  [ "$required" -eq 1 ] && echo "[MISSING — apt install $pkg]" || echo "[optional — apt install $pkg]"
+  return 1
+}
+
+cmd_doctor() {
+  local ok=1
+  echo "rah doctor (v$RAH_VERSION)"
+  _check_dep ssh        openssh-client 1 || ok=0
+  _check_dep sshfs      sshfs          1 || ok=0
+  if command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1; then
+    printf '  %-12s [ok]\n' fusermount
+  else
+    printf '  %-12s [MISSING — apt install fuse3]\n' fusermount; ok=0
+  fi
+  _check_dep jq         jq             1 || ok=0
+  _check_dep base64     coreutils      1 || ok=0
+  _check_dep mountpoint util-linux     1 || ok=0
+  _check_dep curl       curl           0 || true
+  printf '  %-12s ' PATH
+  case ":$PATH:" in
+    *":$RAH_BIN_DIR:"*) echo "[$RAH_BIN_DIR on PATH]" ;;
+    *) echo "[$RAH_BIN_DIR NOT on PATH — add it]" ;;
+  esac
+  local any=0 cfg
+  while IFS= read -r cfg; do [ -n "$cfg" ] && any=1; done < <(_list_configs)
+  [ "$any" -eq 1 ] && { echo "  mounts:"; cmd_status | sed 's/^/    /'; }
+  [ "$ok" -eq 1 ] && echo "rah: all required dependencies present" || _die "missing required dependencies (see above)"
+}
+
+# ---------- self-update / uninstall ----------
+
+cmd_self_update() {
+  command -v curl >/dev/null 2>&1 || _die "curl required for self-update"
+  local dest tmp newver; dest="$(_self_path)"; tmp="$(mktemp)"
+  echo "rah: fetching $RAH_RAW_URL"
+  curl -fsSL "$RAH_RAW_URL" -o "$tmp" || { rm -f "$tmp"; _die "download failed"; }
+  head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || { rm -f "$tmp"; _die "downloaded file does not look like rah"; }
+  newver="$(sed -n 's/^RAH_VERSION="\(.*\)"/\1/p' "$tmp" | head -1)"
+  [ -n "$newver" ] || { rm -f "$tmp"; _die "downloaded file missing version marker"; }
+  chmod +x "$tmp"; mv "$tmp" "$dest"
+  echo "rah: updated $dest ($RAH_VERSION -> $newver)"
+}
+
+cmd_uninstall() {
+  local purge=0
+  case "${1:-}" in --purge) purge=1 ;; "") ;; *) _die "usage: rah uninstall [--purge]" ;; esac
+  local cfg name
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    name="$(basename "$cfg" .env)"
+    cmd_unmount "$name" 2>/dev/null || true
+  done < <(_list_configs)
+  _remove_hook_json "$HOME/.claude/settings.json"; rm -rf "$HOME/.claude/skills/rah"
+  _remove_hook_json "$HOME/.codex/hooks.json";     rm -rf "$HOME/.codex/skills/rah"
+  echo "rah: removed hooks + skills from ~/.claude and ~/.codex"
+  [ -e "$RAH_BIN_DIR/rah" ] && { rm -f "$RAH_BIN_DIR/rah"; echo "rah: removed $RAH_BIN_DIR/rah"; }
+  if [ "$purge" -eq 1 ]; then
+    rm -rf "$RAH_CONFIG_DIR"; echo "rah: purged $RAH_CONFIG_DIR"
+  else
+    echo "rah: kept configs in $RAH_CONFIG_DIR (use --purge to remove)"
+  fi
+}
+
 # ---------- dispatch ----------
 
 _usage() {
-  cat <<'EOF'
-rah — Remote as Host
+  cat <<EOF
+rah — Remote as Host (v$RAH_VERSION)
 
   rah mount [--name N] [--prelude CMD] user@host:/abs/path   mount remote code tree (same path)
   rah unmount <name>                                         unmount + drop ssh master
   rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
-  rah hook                                                   PreToolUse rewrite (reads JSON on stdin)
-  rah init <claude|codex>                                    install hook + skill for an agent
+  rah hook [--decision defer|allow|ask]                      PreToolUse rewrite (reads JSON on stdin)
+  rah init <claude|codex> [--remove]                         install/remove hook + skill for an agent
   rah status                                                 show mounts / ssh master health
+  rah doctor                                                 check dependencies, PATH, mount health
+  rah self-update                                            update rah to the latest version
+  rah uninstall [--purge]                                    remove hooks, skill, and the rah binary
+  rah version                                                print version
 EOF
 }
 
 main() {
   local sub="${1:-}"; [ $# -gt 0 ] && shift || true
   case "$sub" in
-    mount)   cmd_mount "$@" ;;
-    unmount) cmd_unmount "$@" ;;
-    run)     cmd_run "$@" ;;
-    hook)    cmd_hook "$@" ;;
-    init)    cmd_init "$@" ;;
-    status)  cmd_status "$@" ;;
+    mount)       cmd_mount "$@" ;;
+    unmount)     cmd_unmount "$@" ;;
+    run)         cmd_run "$@" ;;
+    hook)        cmd_hook "$@" ;;
+    init)        cmd_init "$@" ;;
+    status)      cmd_status "$@" ;;
+    doctor)      cmd_doctor "$@" ;;
+    self-update) cmd_self_update "$@" ;;
+    uninstall)   cmd_uninstall "$@" ;;
+    version|--version|-v) echo "rah $RAH_VERSION" ;;
     ""|-h|--help|help) _usage ;;
     *) _die "unknown subcommand: $sub (try: rah help)" ;;
   esac
