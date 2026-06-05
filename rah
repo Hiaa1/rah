@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# rah — Remote as Host
+# Edit files via a same-path sshfs mount; execute commands on the remote via ssh.
+# The agent's file tools hit the local mount; its Bash is rewritten (by a PreToolUse
+# hook) to run on the remote — deterministically, with no model awareness.
+set -euo pipefail
+
+RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
+
+_self_path() { readlink -f "${BASH_SOURCE[0]}"; }
+RAH_ROOT="$(dirname "$(_self_path)")"
+SKILL_SRC="$RAH_ROOT/skills/rah/SKILL.md"
+
+# ---------- helpers ----------
+
+_die() { printf 'rah: %s\n' "$*" >&2; exit 1; }
+
+# POSIX single-quote escaping for safe embedding in a remote shell string.
+_shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Read one key from an env-style config file (no sourcing -> no code execution).
+_get() { sed -n "s/^$2=//p" "$1" | head -n1; }
+
+_list_configs() {
+  [ -d "$RAH_CONFIG_DIR" ] || return 0
+  local f
+  for f in "$RAH_CONFIG_DIR"/*.env; do
+    [ -e "$f" ] && printf '%s\n' "$f"
+  done
+}
+
+# Print the config file whose mountpoint is a prefix of $1 (the cwd). Non-zero if none.
+_config_for_cwd() {
+  local cwd="$1" f mp
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    mp="$(_get "$f" mountpoint)"
+    [ -n "$mp" ] || continue
+    case "$cwd/" in
+      "$mp"/*) printf '%s\n' "$f"; return 0 ;;
+    esac
+  done < <(_list_configs)
+  return 1
+}
+
+# ---------- mount ----------
+
+cmd_mount() {
+  local name="" prelude="" target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)    name="$2"; shift 2 ;;
+      --prelude) prelude="$2"; shift 2 ;;
+      --*)       _die "unknown option: $1" ;;
+      *)         target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || _die "usage: rah mount [--name N] [--prelude CMD] user@host:/abs/path"
+
+  local host="${target%%:*}" remote_path="${target#*:}"
+  case "$remote_path" in /*) ;; *) _die "remote path must be absolute: $remote_path" ;; esac
+  [ -n "$name" ] || name="$(printf '%s' "${host##*@}_${remote_path##*/}" | tr -c 'A-Za-z0-9_.-' '_')"
+
+  local mountpoint="$remote_path"                 # same-path: no translation
+  local socket="$HOME/.ssh/cm-${host##*@}"
+
+  mkdir -p "$RAH_CONFIG_DIR"
+  if ! mkdir -p "$mountpoint" 2>/dev/null; then
+    _die "cannot create mountpoint $mountpoint. Run once:
+  sudo mkdir -p $mountpoint && sudo chown $USER: $mountpoint"
+  fi
+
+  if ! ssh -S "$socket" -O check "$host" 2>/dev/null; then
+    ssh -M -S "$socket" -o ControlPersist=600 -fN "$host" \
+      || _die "failed to open ssh master to $host"
+  fi
+
+  if mountpoint -q "$mountpoint" 2>/dev/null; then
+    echo "rah: already mounted at $mountpoint"
+  else
+    sshfs "$host:$remote_path" "$mountpoint" \
+      -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath="$socket" \
+      || _die "sshfs mount failed"
+  fi
+
+  local cfg="$RAH_CONFIG_DIR/$name.env"
+  {
+    printf 'host=%s\n'           "$host"
+    printf 'remote_path=%s\n'    "$remote_path"
+    printf 'mountpoint=%s\n'     "$mountpoint"
+    printf 'control_socket=%s\n' "$socket"
+    printf 'prelude=%s\n'        "$prelude"
+  } > "$cfg"
+  echo "rah: mounted $host:$remote_path at $mountpoint (config: $cfg)"
+}
+
+cmd_unmount() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: rah unmount <name>"
+  local cfg="$RAH_CONFIG_DIR/$name.env"
+  [ -f "$cfg" ] || _die "no such mount: $name"
+  local mp host socket
+  mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"
+  if mountpoint -q "$mp" 2>/dev/null; then
+    fusermount -u "$mp" || _die "fusermount failed for $mp"
+  fi
+  ssh -S "$socket" -O exit "$host" 2>/dev/null || true
+  echo "rah: unmounted $name"
+}
+
+# ---------- run (routing core) ----------
+
+cmd_run() {
+  local cwd="" b64cmd=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) cwd="$2"; shift 2 ;;
+      --b64) b64cmd="$2"; shift 2 ;;
+      --)    shift; break ;;
+      *)     break ;;
+    esac
+  done
+  local cmd
+  if [ -n "$b64cmd" ]; then
+    cmd="$(printf '%s' "$b64cmd" | base64 -d)"
+  else
+    cmd="$*"
+  fi
+  [ -n "$cmd" ] || _die "run: empty command"
+  [ -n "$cwd" ] || cwd="$PWD"
+
+  local cfg
+  if ! cfg="$(_config_for_cwd "$cwd")"; then
+    # Not under any managed mount -> run locally (safety fallthrough).
+    bash -c "$cmd"; exit $?
+  fi
+  local host socket prelude
+  host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; prelude="$(_get "$cfg" prelude)"
+
+  local b64 pre=""
+  b64="$(printf '%s' "$cmd" | base64 -w0)"
+  [ -n "$prelude" ] && pre="{ $prelude; } && "
+
+  local remote="cd $(_shq "$cwd") && ${pre}printf %s $(_shq "$b64") | base64 -d | bash"
+  set +e
+  ssh -S "$socket" "$host" "$remote"
+  local rc=$?
+  set -e
+  exit $rc
+}
+
+# ---------- hook (PreToolUse rewrite; shared by Claude & Codex) ----------
+
+cmd_hook() {
+  set +e
+  local input cmd cwd
+  input="$(cat)"
+  cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
+  cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+  [ -n "$cwd" ] || cwd="$PWD"
+
+  local passthrough=0
+  _config_for_cwd "$cwd" >/dev/null 2>&1 || passthrough=1
+  case "$cmd" in rah|"rah "*) passthrough=1 ;; esac
+
+  # Pure navigation (standalone cd/pushd/popd, no chaining) -> keep local to
+  # preserve the agent's persistent shell cwd.
+  local trimmed="${cmd#"${cmd%%[![:space:]]*}"}"
+  case "$trimmed" in
+    cd|cd\ *|pushd|pushd\ *|popd|popd\ *)
+      case "$cmd" in
+        *'&&'*|*';'*|*'|'*|*$'\n'*) : ;;
+        *) passthrough=1 ;;
+      esac ;;
+  esac
+
+  if [ "$passthrough" -eq 1 ] || [ -z "$cmd" ]; then
+    jq -nc '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow"}}'
+    return 0
+  fi
+
+  local b64 newcmd
+  b64="$(printf '%s' "$cmd" | base64 -w0)"
+  newcmd="rah run --cwd $(_shq "$cwd") --b64 $b64"
+  jq -nc --arg c "$newcmd" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",updatedInput:{command:$c}}}'
+}
+
+# ---------- init (install hook + skill into an agent) ----------
+
+_ensure_path() {
+  mkdir -p "$HOME/.local/bin"
+  local self target="$HOME/.local/bin/rah"; self="$(_self_path)"
+  [ "$self" = "$target" ] || ln -sf "$self" "$target"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) echo "rah: note — add ~/.local/bin to your PATH" ;;
+  esac
+}
+
+# Merge a {matcher:"Bash", hooks:[{type:command, command:"rah hook"}]} entry into
+# .hooks.PreToolUse of a JSON file, idempotently.
+_merge_hook_json() {
+  local file="$1" tmp; tmp="$(mktemp)"
+  [ -f "$file" ] || echo '{}' > "$file"
+  jq '
+    .hooks.PreToolUse = ((.hooks.PreToolUse // [])
+      | if any(.[]; (.hooks // []) | any(.command == "rah hook")) then .
+        else . + [{matcher:"Bash", hooks:[{type:"command", command:"rah hook"}]}] end)
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+_install_skill() {
+  local dir="$1"
+  [ -f "$SKILL_SRC" ] || _die "skill source missing: $SKILL_SRC"
+  mkdir -p "$dir"
+  cp "$SKILL_SRC" "$dir/SKILL.md"
+}
+
+_init_claude() {
+  _ensure_path
+  mkdir -p "$HOME/.claude"
+  _merge_hook_json "$HOME/.claude/settings.json"
+  _install_skill "$HOME/.claude/skills/rah"
+  echo "rah: claude hook + skill installed (~/.claude)"
+}
+
+_init_codex() {
+  _ensure_path
+  mkdir -p "$HOME/.codex"
+  _merge_hook_json "$HOME/.codex/hooks.json"
+  _install_skill "$HOME/.codex/skills/rah"
+  echo "rah: codex hook + skill installed (~/.codex)"
+}
+
+cmd_init() {
+  case "${1:-}" in
+    claude) _init_claude ;;
+    codex)  _init_codex ;;
+    *)      _die "usage: rah init <claude|codex>" ;;
+  esac
+}
+
+# ---------- status ----------
+
+cmd_status() {
+  local any=0 cfg name host mp socket
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    any=1
+    name="$(basename "$cfg" .env)"
+    host="$(_get "$cfg" host)"; mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"
+    printf '● %s\n' "$name"
+    printf '  host:       %s\n' "$host"
+    printf '  mountpoint: %s ' "$mp"
+    mountpoint -q "$mp" 2>/dev/null && printf '[mounted]\n' || printf '[NOT mounted]\n'
+    printf '  ssh master: '
+    ssh -S "$socket" -O check "$host" 2>/dev/null && printf '[alive]\n' || printf '[down]\n'
+  done < <(_list_configs)
+  [ "$any" -eq 1 ] || echo "rah: no managed mounts (run: rah mount user@host:/abs/path)"
+}
+
+# ---------- dispatch ----------
+
+_usage() {
+  cat <<'EOF'
+rah — Remote as Host
+
+  rah mount [--name N] [--prelude CMD] user@host:/abs/path   mount remote code tree (same path)
+  rah unmount <name>                                         unmount + drop ssh master
+  rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
+  rah hook                                                   PreToolUse rewrite (reads JSON on stdin)
+  rah init <claude|codex>                                    install hook + skill for an agent
+  rah status                                                 show mounts / ssh master health
+EOF
+}
+
+main() {
+  local sub="${1:-}"; [ $# -gt 0 ] && shift || true
+  case "$sub" in
+    mount)   cmd_mount "$@" ;;
+    unmount) cmd_unmount "$@" ;;
+    run)     cmd_run "$@" ;;
+    hook)    cmd_hook "$@" ;;
+    init)    cmd_init "$@" ;;
+    status)  cmd_status "$@" ;;
+    ""|-h|--help|help) _usage ;;
+    *) _die "unknown subcommand: $sub (try: rah help)" ;;
+  esac
+}
+
+main "$@"
