@@ -48,6 +48,11 @@ One command checks dependencies, wires your installed agents, and mounts:
 rah setup you@host:/abs/path/to/project
 ```
 
+In a terminal it's interactive: it offers to install missing dependencies, generate and authorize
+your ssh key (`ssh-copy-id`), and create the mount directory with `sudo` — each behind a `[Y/n]`
+(add `-y` to assume yes). Run by an agent with no terminal, it instead prints the one human step
+and stops.
+
 Then launch your agent from inside the mountpoint. Its file tools hit the mount; its commands
 run on the remote. The hook is installed once (restart the agent that first time); after that,
 mounting a new project activates routing immediately — no restart. To remove everything: `rah uninstall`.
@@ -58,7 +63,7 @@ Prefer the explicit steps? `rah doctor` → `rah init claude` (or `codex`) → `
 
 | Command | Purpose |
 |---|---|
-| `rah setup [user@host:/abs/path] [--prelude CMD]` | one-command guided onboarding (doctor + init + mount) |
+| `rah setup [user@host:/abs/path] [-y]` | guided onboarding — interactive: installs deps, sets up ssh key, mounts |
 | `rah mount [--name N] [--prelude CMD] user@host:/abs/path` | mount a remote code tree at the identical path |
 | `rah remount [name]` | recover a dead/stale mount (all if no name) |
 | `rah unmount <name>` | unmount + drop the ssh master |
