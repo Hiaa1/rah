@@ -5,11 +5,13 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.1.1"
+RAH_VERSION="0.1.2"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
 RAH_BIN_DIR="${RAH_BIN_DIR:-$HOME/.local/bin}"
+# Required runtime dependencies as bin:apt-package (fusermount/curl handled separately).
+RAH_DEPS=(ssh:openssh-client sshfs:sshfs jq:jq base64:coreutils timeout:coreutils mountpoint:util-linux)
 
 _self_path() { readlink -f "${BASH_SOURCE[0]}"; }
 
@@ -24,10 +26,21 @@ _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 _get() { sed -n "s/^$2=//p" "$1" | head -n1; }
 
 # Prompt the user via the terminal, even when stdin is a pipe (curl | bash).
+# A controlling terminal exists only if /dev/tty can actually be opened.
+_interactive() { ( : >/dev/tty ) 2>/dev/null; }
+
 _prompt() {
   local msg="$1" ans=""
-  if [ -r /dev/tty ]; then printf '%s' "$msg" >/dev/tty; IFS= read -r ans </dev/tty || true; fi
+  if _interactive; then printf '%s' "$msg" >/dev/tty; IFS= read -r ans </dev/tty || true; fi
   printf '%s' "$ans"
+}
+
+# Yes/no prompt (Enter = yes). Honors RAH_YES=1; declines if non-interactive.
+_confirm() {
+  [ "${RAH_YES:-0}" = 1 ] && return 0
+  _interactive || return 1
+  local ans=""; printf '%s [Y/n] ' "$1" >/dev/tty; IFS= read -r ans </dev/tty || true
+  case "$ans" in [nN]*) return 1 ;; *) return 0 ;; esac
 }
 
 _list_configs() {
@@ -71,6 +84,16 @@ _mount_state() {
 
 # Passwordless ssh reachability probe (BatchMode: never blocks on a password prompt).
 _ssh_ok() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" true 2>/dev/null; }
+
+# Space-separated apt packages for any missing required deps (deduped; empty if all present).
+_missing_pkgs() {
+  local d bin out=""
+  for d in "${RAH_DEPS[@]}"; do
+    bin="${d%%:*}"; command -v "$bin" >/dev/null 2>&1 || out="$out ${d#*:}"
+  done
+  command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1 || out="$out fuse3"
+  printf '%s\n' $out | sort -u | xargs
+}
 
 # The skill document, emitted into each agent's skills dir by `rah init`.
 _skill_doc() {
@@ -415,16 +438,28 @@ cmd_setup() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --prelude) prelude="$2"; prelude_set=1; shift 2 ;;
+      -y|--yes)  RAH_YES=1; shift ;;
       --*)       _die "unknown option: $1" ;;
       *)         target="$1"; shift ;;
     esac
   done
 
   echo "== rah setup =="
-  cmd_doctor            # exits with apt hints if a required dependency is missing
-  echo
 
-  # Wire whichever agents are installed (idempotent); note if a hook was newly added.
+  # 1) Dependencies — in a terminal, offer to install the missing ones.
+  local missing; missing="$(_missing_pkgs)"
+  if [ -n "$missing" ]; then
+    echo "missing dependencies: $missing"
+    if command -v apt-get >/dev/null 2>&1 && _confirm "install them now with sudo apt-get?"; then
+      sudo apt-get update -qq && sudo apt-get install -y $missing || _die "apt install failed"
+      missing="$(_missing_pkgs)"; [ -z "$missing" ] || _die "still missing: $missing"
+    else
+      _die "install these first: $missing"
+    fi
+  fi
+  echo "deps: ok"
+
+  # 2) Wire whichever agents are installed (idempotent); note if a hook was newly added.
   local a adir cfgfile newly=0
   for a in claude codex; do
     adir="$HOME/.$a"; [ -d "$adir" ] || continue
@@ -434,31 +469,45 @@ cmd_setup() {
     echo "agent: $a wired"
   done
 
-  # Resolve the remote target (ask only for the irreducible input).
+  # 3) Remote target (the one irreducible input).
   [ -n "$target" ] || target="$(_prompt 'remote to mount (user@host:/abs/path): ')"
   [ -n "$target" ] || _die "no remote given"
   case "$target" in *:/*) ;; *) _die "expected user@host:/abs/path, got: $target" ;; esac
   local host="${target%%:*}" remote_path="${target#*:}"
 
-  # SSH preflight — rah needs passwordless ssh; fail loud with the one human step.
+  # 4) SSH must be passwordless. In a terminal, offer to generate + authorize a key;
+  #    otherwise (e.g. an agent invoked us) print the one human step and stop.
   if ! _ssh_ok "$host"; then
-    echo "rah: passwordless ssh to '$host' isn't working yet. Authorize your key once:"
-    echo "    ssh-copy-id $host           # enter the remote password this one time"
-    echo "  (or add a Host alias in ~/.ssh/config: HostName / User / Port / IdentityFile)"
-    echo "  verify with: ssh $host true"
-    echo "then re-run: rah setup $target"
-    return 1
+    echo "passwordless ssh to '$host' isn't set up yet."
+    if _interactive; then
+      if ! ls "$HOME"/.ssh/id_*.pub >/dev/null 2>&1; then
+        if _confirm "no ssh key found — generate one (ssh-keygen ed25519)?"; then
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519"
+        fi
+      fi
+      if _confirm "authorize your key on $host now? (you'll enter the remote password once)"; then
+        ssh-copy-id "$host" || true
+      fi
+      _ssh_ok "$host" || { echo "rah: still no passwordless ssh to $host — fix it, then: rah setup $target"; return 1; }
+    else
+      echo "  run once: ssh-copy-id $host    then re-run: rah setup $target"
+      return 1
+    fi
   fi
+  echo "ssh: ok ($host)"
 
-  # Same-path mountpoint — needs root once if it's outside your home.
+  # 5) Same-path mountpoint — create with sudo if it needs root.
   if ! mkdir -p "$remote_path" 2>/dev/null; then
-    echo "rah: the mount path needs root to create once — run:"
-    echo "  sudo mkdir -p $remote_path && sudo chown $USER: $remote_path"
-    echo "then re-run: rah setup $target"
-    return 1
+    if _confirm "mount path $remote_path needs root to create once — do it with sudo?"; then
+      sudo mkdir -p "$remote_path" && sudo chown "$USER": "$remote_path" || _die "could not create $remote_path"
+    else
+      echo "rah: run once: sudo mkdir -p $remote_path && sudo chown $USER: $remote_path"
+      echo "then re-run: rah setup $target"
+      return 1
+    fi
   fi
 
-  # Best-effort prelude auto-probe.
+  # 6) Best-effort prelude auto-probe.
   if [ "$prelude_set" = 0 ]; then
     local socket="$HOME/.ssh/cm-${host##*@}"
     _ensure_master "$host" "$socket" 2>/dev/null || true
@@ -467,9 +516,8 @@ cmd_setup() {
     fi
   fi
 
-  # Mount.
+  # 7) Mount + finish.
   if [ -n "$prelude" ]; then cmd_mount --prelude "$prelude" "$target"; else cmd_mount "$target"; fi
-
   echo
   if [ "$newly" = 1 ]; then
     echo "rah: hook newly installed — restart your agent ONCE so it loads."
@@ -511,19 +559,14 @@ _check_dep() {  # name pkg required(0|1) ; prints status, returns non-zero if mi
 }
 
 cmd_doctor() {
-  local ok=1
+  local ok=1 d
   echo "rah doctor (v$RAH_VERSION)"
-  _check_dep ssh        openssh-client 1 || ok=0
-  _check_dep sshfs      sshfs          1 || ok=0
+  for d in "${RAH_DEPS[@]}"; do _check_dep "${d%%:*}" "${d#*:}" 1 || ok=0; done
   if command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1; then
     printf '  %-12s [ok]\n' fusermount
   else
     printf '  %-12s [MISSING — apt install fuse3]\n' fusermount; ok=0
   fi
-  _check_dep jq         jq             1 || ok=0
-  _check_dep base64     coreutils      1 || ok=0
-  _check_dep timeout    coreutils      1 || ok=0
-  _check_dep mountpoint util-linux     1 || ok=0
   _check_dep curl       curl           0 || true
   printf '  %-12s ' PATH
   case ":$PATH:" in
@@ -576,7 +619,7 @@ _usage() {
   cat <<EOF
 rah — Remote as Host (v$RAH_VERSION)
 
-  rah setup [user@host:/abs/path] [--prelude CMD]            one-command guided onboarding
+  rah setup [user@host:/abs/path] [--prelude CMD] [-y]       guided onboarding (interactive: deps/ssh/mount)
   rah mount [--name N] [--prelude CMD] user@host:/abs/path   mount remote code tree (same path)
   rah remount [name]                                         recover a dead mount (all if no name)
   rah unmount <name>                                         unmount + drop ssh master
