@@ -1,5 +1,7 @@
 # Remote as Host (rah)
 
+[简体中文](README.zh-CN.md)
+
 Make your local machine act as a remote dev box for coding agents (Claude Code, Codex).
 The agent runs locally; your real project — code, heavy datasets, GPU — stays on a remote.
 `rah` gives the agent two enforced planes:
