@@ -1,5 +1,11 @@
 # Remote as Host (rah)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.7-blue)](rah)
+[![Bash](https://img.shields.io/badge/Bash-single_file-4EAA25?logo=gnubash&logoColor=white)](rah)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-verified-7C3AED)](README.md#agent-support)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-verified-111827)](README.md#agent-support)
+
 [简体中文](README.zh-CN.md)
 
 Make your local machine act as a remote dev box for coding agents (Claude Code, Codex).

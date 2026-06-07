@@ -1,5 +1,11 @@
 # Remote as Host (rah)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.7-blue)](rah)
+[![Bash](https://img.shields.io/badge/Bash-single_file-4EAA25?logo=gnubash&logoColor=white)](rah)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-verified-7C3AED)](README.zh-CN.md#agent-支持)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-verified-111827)](README.zh-CN.md#agent-支持)
+
 [English](README.md)
 
 让你的本地机器像远端开发机一样服务 coding agent（Claude Code、Codex）。
