@@ -454,18 +454,29 @@ _ensure_master() {
   ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host"
 }
 
+_remote_uname() {
+  local host="$1" socket="$2" port="${3:-}" ssh_args=()
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  ssh "${ssh_args[@]}" -S "$socket" "$host" 'uname -s 2>/dev/null || true' 2>/dev/null | head -n1
+}
+
 # Mount remote_path at mp. Re-establishes master, clears a stale mount,
 # and skips work if already healthy. Returns sshfs's status.
 _do_mount() {
-  local host="$1" remote_path="$2" mp="$3" socket="$4" port="${5:-}" sshfs_args=()
+  local host="$1" remote_path="$2" mp="$3" socket="$4" port="${5:-}" sshfs_args=() opts remote_os
   [ -n "$port" ] && sshfs_args=(-p "$port")
   _ensure_master "$host" "$socket" "$port" || return 1
   if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
     _mount_alive "$mp" && return 0               # already mounted & healthy
     fusermount -uz "$mp" 2>/dev/null || true     # stale -> clear before remount
   fi
+  opts="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath=$socket"
+  remote_os="$(_remote_uname "$host" "$socket" "$port")"
+  case "$remote_os" in
+    Darwin) opts="$opts,sftp_server=/usr/libexec/sftp-server" ;;
+  esac
   sshfs "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
-    -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath="$socket"
+    -o "$opts"
 }
 
 # ---------- mount ----------

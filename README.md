@@ -52,6 +52,14 @@ This avoids spreading agent logins, browser sessions, API tokens, and account ri
 personal devices with different VPN exits or network locations. The agent account lives in one
 place; remote project execution still happens on the right server.
 
+If you pay for a Claude Code or Codex plan and want to use it from multiple computers, frequently
+logging the same account in from different devices, networks, or VPN exits can increase account
+risk, including security review or lockout. A steadier pattern is to choose one trusted computer as
+the **agent host**: only that A machine stays logged in to Claude Code / Codex. A separate B
+machine or server holds the real project, large datasets, model weights, and outputs. With `rah`,
+the agent on A edits B's project as if it were local, while commands really execute on B, where the
+GPU, datasets, and tuned environment already live.
+
 <p align="center">
   <img src="assets/rah-seamless-dev.png" alt="Rah makes local coding agents work normally while hooks route commands to a remote host" width="900">
 </p>
@@ -101,7 +109,7 @@ For scripts or repeatable setup, pass everything explicitly:
 
 ```bash
 rah setup you@host:~/project
-rah setup --port 27867 you@10.19.125.121:~/project
+rah setup --port 2222 you@devbox.example.com:~/project
 ```
 
 > **Run `rah setup` in a real terminal — not inside the coding agent.** It walks you through any
@@ -115,7 +123,7 @@ By default, the local mount lands at `~/mnt_rah/<project>`. To choose your own l
 pass it explicitly:
 
 ```bash
-rah setup you@host:~/project ~/Fyx/project
+rah setup you@host:~/project ~/projects/project
 ```
 
 For strict identical local/remote paths, opt in with `--same-path`.
@@ -135,7 +143,7 @@ rah verify
 ```
 
 Prefer the explicit steps? `rah doctor` -> `rah init claude` (or `codex`) ->
-`rah mount user@host:~/project ~/Fyx/project`.
+`rah mount user@host:~/project ~/projects/project`.
 
 ## Commands
 

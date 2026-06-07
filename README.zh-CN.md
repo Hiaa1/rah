@@ -40,6 +40,12 @@ agent 仍然运行在本地；真正的项目、代码、重数据集和 GPU 都
 这样可以避免把 agent 登录态、浏览器会话、API token 和账号风险散落到多台个人设备上，尤其是多台设备使用不同 VPN 出口或网络位置时。
 agent 账号只留在一个地方；真正的项目执行仍然发生在正确的远端机器上。
 
+如果你购买了 Claude Code 或 Codex 的个人 plan，又希望在多台电脑上使用同一个账号，那么频繁在不同设备、
+不同网络或不同 VPN 出口登录，可能会增加账号风控甚至封禁风险。更稳妥的方式是固定一台可信电脑作为
+**agent host**：只在这台 A 电脑上登录 Claude Code / Codex；另一台 B 电脑或服务器存放真正的项目、
+大型数据集、模型权重和输出文件。通过 `rah`，A 电脑上的 agent 像操作本地目录一样编辑 B 电脑上的项目；
+命令则在 B 电脑上真实执行，例如调用显卡、读取本地大数据集或使用已经配置好的远端环境。
+
 <p align="center">
   <img src="assets/rah-seamless-dev.png" alt="Rah 让本地 coding agent 保持正常体验，同时由 hook 将命令路由到远端执行" width="900">
 </p>
@@ -85,7 +91,7 @@ rah setup
 
 ```bash
 rah setup you@host:~/project
-rah setup --port 27867 you@10.19.125.121:~/project
+rah setup --port 2222 you@devbox.example.com:~/project
 ```
 
 > **请在真实终端里运行 `rah setup`，不要在 coding agent 里运行。** 它会通过 `[Y/n]` 提示处理缺失前置条件：安装依赖（`sudo apt`）、生成并授权 ssh key（`ssh-copy-id`），或者在你指定的本地挂载目录需要 root 时创建目录（`sudo`）。这些步骤需要 TTY 来读取密码，而 coding agent 的 shell，包括 Claude Code 的 `!`，没有 TTY，所以会失败。加 `-y` 可以默认确认。无 TTY 运行时，`rah setup` 会检测到并打印需要人手执行的下一步，而不是卡住。
@@ -93,7 +99,7 @@ rah setup --port 27867 you@10.19.125.121:~/project
 默认本地挂载目录是 `~/mnt_rah/<project>`。如果想挂到自己指定的位置，直接把本地目录作为第二个参数：
 
 ```bash
-rah setup you@host:~/project ~/Fyx/project
+rah setup you@host:~/project ~/projects/project
 ```
 
 如果确实需要本地和远端绝对路径完全一致，可以显式使用 `--same-path`。
@@ -109,7 +115,7 @@ cd ~/mnt_rah/project
 rah verify
 ```
 
-偏好显式步骤的话：`rah doctor` -> `rah init claude`（或 `codex`）-> `rah mount user@host:~/project ~/Fyx/project`。
+偏好显式步骤的话：`rah doctor` -> `rah init claude`（或 `codex`）-> `rah mount user@host:~/project ~/projects/project`。
 
 ## 命令
 
