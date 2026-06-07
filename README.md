@@ -6,9 +6,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0-blue)](rah)
-[![Bash](https://img.shields.io/badge/Bash-single_file-4EAA25?logo=gnubash&logoColor=white)](rah)
-[![Claude Code](https://img.shields.io/badge/Claude_Code-verified-7C3AED)](README.md#agent-support)
-[![Codex CLI](https://img.shields.io/badge/Codex_CLI-verified-111827)](README.md#agent-support)
+[![Views](https://hits.sh/github.com/Hiaa1/rah.svg?label=views&color=0e75b6)](https://hits.sh/github.com/Hiaa1/rah/)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-compatible-7C3AED)](README.md#agent-support)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-compatible-111827)](README.md#agent-support)
 
 [简体中文](README.zh-CN.md)
 
