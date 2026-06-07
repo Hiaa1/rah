@@ -66,3 +66,4 @@ case ":$PATH:" in
 esac
 header "Next"
 cmd "rah setup"
+note "On Ubuntu/Debian/WSL2, rah setup can offer to install required packages with apt."

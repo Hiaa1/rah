@@ -28,6 +28,20 @@ Routing is an *invariant enforced by a hook*, not a request in a prompt — the 
 forget to run on the remote. **Zero remote footprint:** only your machine installs `rah`; the
 remote needs nothing but a stock `sshd`, `bash`, and `base64`.
 
+## Project scope
+
+`rah` is intentionally scoped to a Linux-based agent gateway model:
+
+- The **agent host** is a Linux environment that can run Claude Code / Codex, `sshfs`/FUSE,
+  `ssh`, and standard shell tools. Ubuntu, Debian, and WSL2 are the primary targets.
+- The **remote host** only needs OpenSSH server plus a POSIX shell; no `rah` install is required
+  there.
+- Installation differs by Linux distribution: Ubuntu/Debian/WSL2 can use the guided `apt-get`
+  path, while other Linux distributions need equivalent packages from their own package manager.
+
+Native macOS and native Windows are outside the current scope. Use a Linux gateway machine or WSL2
+when your personal device is macOS or Windows.
+
 ## Trusted agent gateway
 
 `rah` also supports a safer account model for coding agents: keep Claude Code / Codex logged in on
@@ -56,6 +70,12 @@ git clone https://github.com/Hiaa1/rah && cd rah && ./install.sh
 ```
 
 `rah` is a single self-contained Bash script — auditable in one file, and `scp`-able to any host.
+
+### Platform notes
+
+The supported runtime is Linux with sshfs/FUSE and the required command-line tools. On Ubuntu,
+Debian, and WSL2, `rah setup` can offer to install missing local packages with `sudo apt-get`.
+On other Linux distributions, install the equivalent packages yourself before running setup.
 
 ### Or just ask your agent
 
@@ -202,7 +222,9 @@ target path for rah today; use the interactive CLI/TUI for transparent remote ex
 
 ## Requirements
 
-- **Local:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils` (`base64`),
+- **Supported local OS:** Linux with sshfs/FUSE support; primary target is Ubuntu, Debian, and WSL2.
+  Native macOS and native Windows are not supported.
+- **Local packages:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils` (`base64`),
   `util-linux` (`mountpoint`); `curl` for install/self-update. Run `rah doctor` to check.
 - **SSH:** passwordless key-based ssh to the remote — `ssh <host> true` must succeed without a
   prompt. `rah setup` preflights this and points you to `ssh-copy-id` if it's missing.

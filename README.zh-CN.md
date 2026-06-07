@@ -22,6 +22,16 @@ agent 仍然运行在本地；真正的项目、代码、重数据集和 GPU 都
 路由是 hook 强制的不变量，不是 prompt 里的请求，所以模型不会“忘记”在远端运行。
 **远端零安装**：只在本机安装 `rah`；远端只需要标准的 `sshd`、`bash` 和 `base64`。
 
+## 项目边界
+
+`rah` 有意聚焦在 Linux-based agent gateway 这一种模型上：
+
+- **agent host** 是一台 Linux 环境，能够运行 Claude Code / Codex、`sshfs`/FUSE、`ssh` 和标准 shell 工具。Ubuntu、Debian 和 WSL2 是主要目标。
+- **remote host** 只需要 OpenSSH server 和 POSIX shell；远端不需要安装 `rah`。
+- 不同 Linux 发行版的差异主要在安装依赖：Ubuntu/Debian/WSL2 可以走 `apt-get` 引导安装，其它 Linux 发行版需要用自己的包管理器安装等价依赖。
+
+原生 macOS 和原生 Windows 不在当前项目范围内。如果个人设备是 macOS 或 Windows，请使用 Linux gateway 机器或 WSL2。
+
 ## 可信 Agent 网关
 
 `rah` 也支持一种更安全的 coding agent 账号模型：只在一台可信机器上登录 Claude Code / Codex，
@@ -48,6 +58,11 @@ git clone https://github.com/Hiaa1/rah && cd rah && ./install.sh
 ```
 
 `rah` 是一个自包含 Bash 脚本，方便审计，也可以直接 `scp` 到其它机器。
+
+### 平台说明
+
+支持的运行环境是具备 sshfs/FUSE 和必要命令行工具的 Linux。在 Ubuntu、Debian 和 WSL2 上，
+`rah setup` 可以询问后通过 `sudo apt-get` 自动安装缺失的本地包。其它 Linux 发行版请先用自己的包管理器安装等价依赖，再运行 setup。
 
 ### 或者直接让 agent 安装
 
@@ -166,7 +181,8 @@ Codex 在安装或更新后可能要求你 review hooks。对 rah hook 选择 **
 
 ## 要求
 
-- **本地**：`bash`、`ssh`、`sshfs`（加 `fuse`/`fuse3`）、`jq`、`coreutils`（`base64`）、`util-linux`（`mountpoint`）；安装和自更新需要 `curl`。运行 `rah doctor` 检查。
+- **支持的本地系统**：具备 sshfs/FUSE 支持的 Linux；主要目标是 Ubuntu、Debian 和 WSL2。当前不支持原生 macOS 和原生 Windows。
+- **本地依赖包**：`bash`、`ssh`、`sshfs`（加 `fuse`/`fuse3`）、`jq`、`coreutils`（`base64`）、`util-linux`（`mountpoint`）；安装和自更新需要 `curl`。运行 `rah doctor` 检查。
 - **SSH**：必须能 passwordless key-based ssh 到远端，`ssh <host> true` 不能要求输入密码。`rah setup` 会预检，并在缺失时提示 `ssh-copy-id`。
 - **远端**：只需要标准 OpenSSH server 和 POSIX shell。
 

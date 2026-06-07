@@ -957,7 +957,8 @@ cmd_setup() {
 	      sudo apt-get update -qq && sudo apt-get install -y $missing || _die "apt install failed"
 	      missing="$(_missing_pkgs)"; [ -z "$missing" ] || _die "still missing: $missing"
 	    else
-	      _die "install these first: $missing"
+	      command -v apt-get >/dev/null 2>&1 || _say_warn "automatic dependency install currently supports apt-get systems only"
+	      _die "install these packages first: $missing"
 	    fi
 	  fi
 	  _say_ok "all required commands are available"
