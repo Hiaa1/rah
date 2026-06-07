@@ -1,7 +1,11 @@
 # Remote as Host (rah)
 
+<p align="center">
+  <img src="assets/rah-logo.svg" alt="Rah logo - local agent with files mounted from a remote host and commands routed to it" width="720">
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.7-blue)](rah)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](rah)
 [![Bash](https://img.shields.io/badge/Bash-single_file-4EAA25?logo=gnubash&logoColor=white)](rah)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-verified-7C3AED)](README.md#agent-support)
 [![Codex CLI](https://img.shields.io/badge/Codex_CLI-verified-111827)](README.md#agent-support)
@@ -12,9 +16,10 @@ Make your local machine act as a remote dev box for coding agents (Claude Code, 
 The agent runs locally; your real project — code, heavy datasets, GPU — stays on a remote.
 `rah` gives the agent two enforced planes:
 
-- **Files** are edited through a **same-path sshfs mount** of the remote code tree, so the
-  agent's native read/edit/grep tools just work. Datasets are *not* mounted (they stay
-  remote), so a stray search can't drag gigabytes over the network.
+- **Files** are edited through an **sshfs mount** of the remote code tree. By default, rah
+  mounts projects under `~/mnt_rah/<project>`; you can also choose any empty local directory.
+  Datasets are *not* mounted (they stay remote), so a stray search can't drag gigabytes over
+  the network.
 - **Execution** is transparently routed to the remote over ssh by a `PreToolUse` **hook**
   that rewrites the agent's shell commands — deterministically, with no instructions to the
   model. The agent behaves as if it were on the remote machine.
@@ -22,6 +27,20 @@ The agent runs locally; your real project — code, heavy datasets, GPU — stay
 Routing is an *invariant enforced by a hook*, not a request in a prompt — the model cannot
 forget to run on the remote. **Zero remote footprint:** only your machine installs `rah`; the
 remote needs nothing but a stock `sshd`, `bash`, and `base64`.
+
+## Trusted agent gateway
+
+`rah` also supports a safer account model for coding agents: keep Claude Code / Codex logged in on
+one trusted machine, then reach that machine from your laptop or desktop over your own remote-access
+channel. From there, `rah` controls any server or workstation over ssh.
+
+This avoids spreading agent logins, browser sessions, API tokens, and account risk across multiple
+personal devices with different VPN exits or network locations. The agent account lives in one
+place; remote project execution still happens on the right server.
+
+<p align="center">
+  <img src="assets/rah-seamless-dev.png" alt="Rah makes local coding agents work normally while hooks route commands to a remote host" width="900">
+</p>
 
 ## Install
 
@@ -42,7 +61,7 @@ git clone https://github.com/Hiaa1/rah && cd rah && ./install.sh
 
 In any Claude Code / Codex session, one sentence is enough — no pre-install needed:
 
-> **"Install rah from github.com/Hiaa1/rah and set it up for `you@host:/abs/path`."**
+> **"Install rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`."**
 
 The agent follows this README: it checks passwordless ssh (and walks you through `ssh-copy-id` if
 it's missing — you enter the remote password that one time), installs rah, and runs `rah setup`.
@@ -50,22 +69,36 @@ You're asked only for the remote, that one ssh authorization, and a single resta
 
 ## Quickstart
 
-One command checks dependencies, wires your installed agents, and mounts:
+One command starts the guided setup. It asks for your ssh target, optional port, remote project
+path, and local mount directory, then checks dependencies, wires your installed agents, mounts,
+and prints the exact command it is executing:
 
 ```bash
-rah setup you@host:/abs/path/to/project
+rah setup
+```
+
+For scripts or repeatable setup, pass everything explicitly:
+
+```bash
+rah setup you@host:~/project
+rah setup --port 27867 you@10.19.125.121:~/project
 ```
 
 > **Run `rah setup` in a real terminal — not inside the coding agent.** It walks you through any
 > missing prerequisite behind a `[Y/n]` prompt: installing dependencies (`sudo apt`), generating
-> and authorizing your ssh key (`ssh-copy-id`), and creating the same-path mount directory
-> (`sudo`). Those steps need a TTY to read a password, and a coding agent's shell — including
+> and authorizing your ssh key (`ssh-copy-id`), or creating a custom local mount directory if it
+> needs `sudo`. Those steps need a TTY to read a password, and a coding agent's shell — including
 > Claude Code's `!` — has **no TTY**, so they fail there. Add `-y` to assume yes. (Run headless,
 > `rah setup` detects the missing terminal and prints the one human step instead of hanging.)
 
-> **Tip — try it without `sudo`:** mount a throwaway path under `/tmp` (writable on both ends, so
-> no root needed): `rah setup you@host:/tmp/rah-test`. Good for a first end-to-end check before
-> committing to a real same-path project mount.
+By default, the local mount lands at `~/mnt_rah/<project>`. To choose your own local directory,
+pass it explicitly:
+
+```bash
+rah setup you@host:~/project ~/Fyx/project
+```
+
+For strict identical local/remote paths, opt in with `--same-path`.
 
 Deploy once in a terminal; after that, day-to-day use is all through the agent (it never needs a
 TTY or `sudo`).
@@ -77,22 +110,25 @@ mounting a new project activates routing immediately — no restart. To remove e
 Check the setup before handing it to an agent:
 
 ```bash
-cd /abs/path/to/project
+cd ~/mnt_rah/project
 rah verify
 ```
 
-Prefer the explicit steps? `rah doctor` → `rah init claude` (or `codex`) → `rah mount user@host:/abs/path`.
+Prefer the explicit steps? `rah doctor` -> `rah init claude` (or `codex`) ->
+`rah mount user@host:~/project ~/Fyx/project`.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `rah setup [user@host:/abs/path] [-y]` | guided onboarding — interactive: installs deps, sets up ssh key, mounts |
-| `rah mount [--name N] [--prelude CMD] user@host:/abs/path` | mount a remote code tree at the identical path |
-| `rah remount [name]` | recover a dead/stale mount (all if no name) |
-| `rah unmount <name>` | unmount + drop the ssh master |
+| `rah setup [--port PORT] [user@host:/path] [local-path] [-y]` | guided onboarding: deps, ssh key, agent hooks, mount |
+| `rah mount [--name N] [--port PORT] [--prelude CMD] user@host:/path [local-path]` | mount a remote code tree locally; defaults to `~/mnt_rah/<project>` |
+| `rah mount --same-path user@host:/abs/path` | opt into identical local/remote path mode |
+| `rah remount [name\|path]` | recover a dead/stale mount (all if no target) |
+| `rah unmount <name\|path>` | unmount + drop the ssh master, keep config |
+| `rah remove [--keep-local] [name\|path]` | unmount, remove rah config, rmdir empty mountpoint; current mount if omitted |
 | `rah init <claude\|codex> [--remove]` | install/remove the hook + skill for an agent |
-| `rah status` | mount / ssh / exec / agent-hook health |
+| `rah status` / `rah list` | mount / ssh / exec / agent-hook health |
 | `rah verify [name\|path]` | end-to-end mount/ssh/hook check |
 | `rah doctor` | check dependencies, PATH, mount health |
 | `rah self-update` | update to the latest version |
@@ -100,18 +136,32 @@ Prefer the explicit steps? `rah doctor` → `rah init claude` (or `codex`) → `
 | `rah run --cwd <dir> -- <cmd>` | run a command on the remote (used by the hook) |
 | `rah hook-log on\|off\|status\|clear` | enable/inspect hook diagnostics |
 
+## Mount management
+
+Use `rah status` or `rah list` to see every managed mount, including its name, remote path,
+local path, mount health, ssh reachability, and exec-plane health.
+
+- `rah unmount <name|path>` disconnects the mount but keeps the config, so `rah remount <name|path>` can recover it later.
+- `rah remove [name|path]` disconnects it, removes the rah config, and removes the local mountpoint only if the directory is empty.
+- `rah remove --keep-local [name|path]` removes rah's config while leaving the local directory in place.
+
 ## How it works
 
+<p align="center">
+  <img src="assets/rah-workflow.png" alt="Rah workflow showing remote files mounted locally and commands routed back to the remote host" width="900">
+</p>
+
 ```
-agent file tools ──► same-path sshfs mount ──► remote code tree
+agent file tools ──► local sshfs mount ──► remote code tree
 agent commands ──► PreToolUse hook ──► rah run ──► ssh(ControlMaster) ──► remote: cd + prelude + cmd
 ```
 
 The hook self-gates by working directory: outside a rah-managed mount it passes commands
 through unchanged, so it is safe even if other projects share the same agent. Commands are
 carried to the remote base64-encoded (no quoting/injection issues), and the remote exit code is
-propagated so the agent's run/verify loop works normally. Standalone `cd` stays local so the
-shell's working directory is preserved across commands.
+propagated so the agent's run/verify loop works normally. In mapped mode, rah translates the
+local cwd and local absolute path prefixes back to the remote project path before execution.
+Standalone `cd` stays local so the shell's working directory is preserved across commands.
 
 ## Recovery
 

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # rah — Remote as Host
-# Edit files via a same-path sshfs mount; execute commands on the remote via ssh.
+# Edit files via an sshfs mount; execute commands on the remote via ssh.
 # The agent's file tools hit the local mount; its Bash is rewritten (by a PreToolUse
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.1.7"
+RAH_VERSION="0.2.0"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
 RAH_BIN_DIR="${RAH_BIN_DIR:-$HOME/.local/bin}"
+RAH_MOUNT_ROOT="${RAH_MOUNT_ROOT:-$HOME/mnt_rah}"
 RAH_HOOK_LOG_DEFAULT="$RAH_CONFIG_DIR/hook.jsonl"
 RAH_HOOK_LOG_FLAG="$RAH_CONFIG_DIR/hook-log"
 # Required runtime dependencies as bin:apt-package (fusermount/curl handled separately).
@@ -19,13 +20,187 @@ _self_path() { readlink -f "${BASH_SOURCE[0]}"; }
 
 # ---------- helpers ----------
 
-_die() { printf 'rah: %s\n' "$*" >&2; exit 1; }
+_color_enabled() {
+  case "${RAH_COLOR:-auto}" in
+    always) return 0 ;;
+    never|0|false|False|FALSE|off|OFF|no|NO) return 1 ;;
+    *)
+      [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ] ;;
+  esac
+}
+
+if _color_enabled; then
+  RAH_RESET=$'\033[0m'
+  RAH_BOLD=$'\033[1m'
+  RAH_DIM=$'\033[2m'
+  RAH_RED=$'\033[31m'
+  RAH_GREEN=$'\033[32m'
+  RAH_YELLOW=$'\033[33m'
+  RAH_BLUE=$'\033[34m'
+  RAH_CYAN=$'\033[36m'
+else
+  RAH_RESET=""; RAH_BOLD=""; RAH_DIM=""; RAH_RED=""
+  RAH_GREEN=""; RAH_YELLOW=""; RAH_BLUE=""; RAH_CYAN=""
+fi
+
+_say_header() { printf '%b\n' "${RAH_BOLD}${RAH_BLUE}==> $*${RAH_RESET}"; }
+_say_ok() { printf '%b\n' "  ${RAH_GREEN}[ok]${RAH_RESET} $*"; }
+_say_warn() { printf '%b\n' "  ${RAH_YELLOW}[warn]${RAH_RESET} $*"; }
+_say_fail() { printf '%b\n' "  ${RAH_RED}[fail]${RAH_RESET} $*"; }
+_say_note() { printf '%b\n' "  ${RAH_DIM}$*${RAH_RESET}"; }
+_say_cmd() { printf '%b\n' "  ${RAH_CYAN}$*${RAH_RESET}"; }
+_tag_ok() { printf '%b' "${RAH_GREEN}[$*]${RAH_RESET}"; }
+_tag_warn() { printf '%b' "${RAH_YELLOW}[$*]${RAH_RESET}"; }
+_tag_fail() { printf '%b' "${RAH_RED}[$*]${RAH_RESET}"; }
+_tag_note() { printf '%b' "${RAH_DIM}[$*]${RAH_RESET}"; }
+
+_die() { printf '%b\n' "${RAH_RED}rah: error:${RAH_RESET} $*" >&2; exit 1; }
 
 # POSIX single-quote escaping for safe embedding in a remote shell string.
 _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # Read one key from an env-style config file (no sourcing -> no code execution).
 _get() { sed -n "s/^$2=//p" "$1" | head -n1; }
+
+_safe_id() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'; }
+
+_path_base() {
+  local b
+  b="$(basename "$1")"
+  [ "$b" = "/" ] && b="root"
+  printf '%s\n' "$b"
+}
+
+_socket_for_host() {
+  local host="$1" port="${2:-}"
+  [ -n "$port" ] || port="default"
+  printf '%s/.ssh/cm-rah-%s-%s\n' "$HOME" "$(_safe_id "$host")" "$(_safe_id "$port")"
+}
+
+_default_mountpoint() {
+  local host="$1" remote_path="$2" base
+  base="$(_safe_id "$(_path_base "$remote_path")")"
+  printf '%s/%s\n' "$RAH_MOUNT_ROOT" "$base"
+}
+
+_default_mount_name() {
+  local host="$1" remote_path="$2"
+  _safe_id "${host}_$(_path_base "$remote_path")"
+}
+
+_default_remote_path() {
+  local base
+  base="$(_path_base "$PWD")"
+  case "$base" in ""|.|/) base="project" ;; esac
+  printf '~/%s\n' "$base"
+}
+
+_setup_command_preview() {
+  local port="$1" target="$2" local_arg="$3" same_path="$4" prelude_set="$5" prelude="$6"
+  local cmd="rah setup"
+  [ -n "$port" ] && cmd="$cmd --port $(_shq "$port")"
+  [ "$same_path" -eq 1 ] && cmd="$cmd --same-path"
+  [ "$prelude_set" = 1 ] && cmd="$cmd --prelude $(_shq "$prelude")"
+  cmd="$cmd $(_shq "$target")"
+  [ -n "$local_arg" ] && cmd="$cmd $(_shq "$local_arg")"
+  printf '%s\n' "$cmd"
+}
+
+_setup_collect_target() {
+  local in_target="$1" in_port="$2" out_file="$3"
+  local ssh_target="" remote_raw="" remote_default="" ans="" port="$in_port" target="$in_target"
+
+	  if [ -z "$target" ]; then
+	    _interactive || _die "setup needs a remote target in non-interactive shells. Run: rah setup [--port PORT] user@host:~/project [local-path]"
+	    _say_header "Remote"
+	    ssh_target="$(_prompt '  ssh target (alias or user@host): ')"
+	    [ -n "$ssh_target" ] || _die "no ssh target given"
+    if [ -z "$port" ]; then
+      ans="$(_prompt '  ssh port [ssh config/default]: ')"
+      port="$ans"
+    fi
+    remote_default="$(_default_remote_path)"
+    ans="$(_prompt "  remote project path [$remote_default]: ")"
+    remote_raw="${ans:-$remote_default}"
+    target="$ssh_target:$remote_raw"
+	  elif [[ "$target" != *:* ]]; then
+	    _interactive || _die "expected user@host:/path or user@host:~/path, got: $target"
+	    _say_header "Remote"
+	    ssh_target="$target"
+    if [ -z "$port" ]; then
+      ans="$(_prompt 'ssh port [ssh config/default]: ')"
+      port="$ans"
+    fi
+    remote_default="$(_default_remote_path)"
+    ans="$(_prompt "remote project path [$remote_default]: ")"
+    remote_raw="${ans:-$remote_default}"
+    target="$ssh_target:$remote_raw"
+  fi
+
+  case "$port" in ""|*[!0-9]*) [ -z "$port" ] || _die "--port must be numeric: $port" ;; esac
+  case "$target" in *:*) ;; *) _die "expected user@host:/path or user@host:~/path, got: $target" ;; esac
+  {
+    printf 'target=%s\n' "$target"
+    printf 'port=%s\n' "$port"
+  } > "$out_file"
+}
+
+_trim_trailing_slashes() {
+  local p="$1"
+  while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  printf '%s\n' "$p"
+}
+
+_expand_local_path() {
+  local p="${1:-.}"
+  case "$p" in
+    "~") p="$HOME" ;;
+    "~/"*) p="$HOME/${p:2}" ;;
+    "~"*) _die "local ~user paths are not supported: $p" ;;
+    /*) ;;
+    *) p="$PWD/$p" ;;
+  esac
+  _trim_trailing_slashes "$p"
+}
+
+_resolve_remote_path() {
+  local host="$1" p="$2" port="${3:-}" home="" ssh_args=()
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  case "$p" in
+    "~")
+      ssh "${ssh_args[@]}" -o BatchMode=yes "$host" 'printf %s "$HOME"' ;;
+    "~/"*)
+      home="$(ssh "${ssh_args[@]}" -o BatchMode=yes "$host" 'printf %s "$HOME"')" || return 1
+      printf '%s/%s\n' "$home" "${p:2}" ;;
+    /*)
+      printf '%s\n' "$p" ;;
+    *)
+      return 2 ;;
+  esac
+}
+
+_prepare_mountpoint() {
+  local mp="$1" allow_sudo="${2:-0}" first=""
+  if ! mkdir -p "$mp" 2>/dev/null; then
+    if [ "$allow_sudo" = 1 ] && _confirm "local mount path $mp needs root to create once — do it with sudo?"; then
+      sudo mkdir -p "$mp" && sudo chown "$USER": "$mp" || return 1
+    else
+      echo "rah: cannot create local mountpoint $mp. Run once:" >&2
+      echo "  sudo mkdir -p $(_shq "$mp") && sudo chown $USER: $(_shq "$mp")" >&2
+      return 1
+    fi
+  fi
+  mp="$(cd -P "$mp" && pwd -P)" || return 1
+  if ! timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+    first="$(find "$mp" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | head -n 1 || true)"
+    if [ -n "$first" ]; then
+      echo "rah: local mountpoint is not empty: $mp" >&2
+      echo "  choose an empty directory, or pass another local path." >&2
+      return 1
+    fi
+  fi
+  printf '%s\n' "$mp"
+}
 
 # Prompt the user via the terminal, even when stdin is a pipe (curl | bash).
 # A controlling terminal exists only if /dev/tty can actually be opened.
@@ -67,6 +242,39 @@ _config_for_cwd() {
   return 1
 }
 
+_config_for_mountpoint_exact() {
+  local mp="$1" f cfg_mp
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    cfg_mp="$(_get "$f" mountpoint)"
+    [ "$cfg_mp" = "$mp" ] && { printf '%s\n' "$f"; return 0; }
+  done < <(_list_configs)
+  return 1
+}
+
+_remote_cwd() {
+  local cfg="$1" cwd="$2" mp remote suffix
+  mp="$(_get "$cfg" mountpoint)"
+  remote="$(_get "$cfg" remote_path)"
+  case "$cwd/" in
+    "$mp"/*)
+      suffix="${cwd#"$mp"}"
+      printf '%s%s\n' "$remote" "$suffix"
+      return 0 ;;
+  esac
+  printf '%s\n' "$cwd"
+}
+
+_translate_command_paths() {
+  local cfg="$1" cmd="$2" mp remote
+  mp="$(_get "$cfg" mountpoint)"
+  remote="$(_get "$cfg" remote_path)"
+  if [ -n "$mp" ] && [ "$mp" != "$remote" ]; then
+    cmd="${cmd//$mp/$remote}"
+  fi
+  printf '%s' "$cmd"
+}
+
 # Fast, timeout-guarded liveness probe. A dead fuse mount hangs on access, so this
 # must never run unguarded. Returns 0 if the path is reachable.
 _mount_alive() { timeout 2 stat "$1" >/dev/null 2>&1; }
@@ -85,7 +293,34 @@ _mount_state() {
 }
 
 # Passwordless ssh reachability probe (BatchMode: never blocks on a password prompt).
-_ssh_ok() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" true 2>/dev/null; }
+_ssh_ok() {
+  local host="$1" port="${2:-}" ssh_args=()
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>/dev/null
+}
+
+_ssh_failure_details() {
+  local host="$1" port="${2:-}" out="" ssh_args=()
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  out="$(ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>&1 >/dev/null || true)"
+  printf '%s\n' "$out" | sed '/^$/d' | head -n 3
+}
+
+_explain_ssh_failure() {
+  local host="$1" port="${2:-}" details="" target="$1"
+  [ -n "$port" ] && target="$target -p $port"
+  details="$(_ssh_failure_details "$host" "$port")"
+  printf '%b\n' "${RAH_RED}rah: error:${RAH_RESET} ssh preflight failed for '$target'." >&2
+  if [ -n "$details" ]; then
+    printf '%s\n' "$details" | sed 's/^/  ssh: /' >&2
+  fi
+  if [ -n "$port" ]; then
+    printf '%b\n' "  ${RAH_CYAN}ssh -p $port -o BatchMode=yes -o ConnectTimeout=5 $host true${RAH_RESET}" >&2
+  else
+    printf '%b\n' "  ${RAH_CYAN}ssh -o BatchMode=yes -o ConnectTimeout=5 $host true${RAH_RESET}" >&2
+  fi
+  echo "  if you normally use an ssh alias, use that alias in the rah target." >&2
+}
 
 # Print the active hook log path. Logging is disabled unless RAH_HOOK_LOG is set
 # or `rah hook-log on` has written a flag file.
@@ -165,8 +400,8 @@ description: Remote as Host — manage the sshfs mount and remote execution for 
 
 # rah — Remote as Host
 
-`rah` lets this host act as a remote dev box: files are edited through a same-path
-sshfs mount, while command execution is transparently routed to the remote over ssh
+`rah` lets this host act as a remote dev box: files are edited through an sshfs
+mount, while command execution is transparently routed to the remote over ssh
 by a `PreToolUse` hook. **You do not need to prefix commands with `ssh` or do anything
 special — when the working directory is a rah-managed mount, your normal Bash commands
 already run on the remote (with its GPU, datasets, and environment).**
@@ -178,15 +413,19 @@ Execution routing is automatic; never wrap commands in ssh manually.
 
 ## Commands
 
-- `rah setup [user@host:/abs/path]` — one-command onboarding: checks dependencies, wires the
-  installed agents, and mounts. When helping a user set this up, ask them **only** for the host
-  and the absolute remote path; everything else (agents, deps, env prelude) is auto-detected.
-- `rah status` — list managed mounts; show mounted / DEAD / not-mounted and ssh-master health.
-- `rah mount [--name N] [--prelude 'CMD'] user@host:/abs/path` — mount a remote code tree at the
-  identical absolute path. `--prelude` is a shell snippet run before each remote command
-  (e.g. `source .venv/bin/activate`) to fix the remote environment.
-- `rah remount [name]` — recover a dead/stale mount (re-establishes ssh + sshfs). No name = all.
-- `rah unmount <name>` — unmount and drop the ssh master connection.
+- `rah setup` — interactive onboarding: asks for ssh target, port, remote project path, and
+  local mount directory; then checks dependencies, wires the installed agents, and mounts.
+- `rah setup [--port PORT] user@host:/path [local-path]` — scriptable form of the same flow.
+  `~/path` is accepted for the remote path.
+- `rah status` / `rah list` — list managed mounts; show mounted / DEAD / not-mounted and ssh-master health.
+- `rah mount [--name N] [--port PORT] [--prelude 'CMD'] user@host:/path [local-path]` — mount a remote
+  code tree at a local directory. If no local path is given, rah uses
+  `~/mnt_rah/<project>`. Use `.` for the current directory, or `--same-path` when
+  you intentionally want identical-path mode. `--prelude` is a shell snippet run before
+  each remote command (e.g. `source .venv/bin/activate`) to fix the remote environment.
+- `rah remount [name|path]` — recover a dead/stale mount (re-establishes ssh + sshfs). No target = all.
+- `rah unmount <name|path>` — unmount and drop the ssh master connection, keeping the config.
+- `rah remove [--keep-local] [name|path]` — unmount, remove rah config, and remove the empty mountpoint directory.
 - `rah init <claude|codex>` — install the routing hook and this skill for an agent.
 
 ## Recovery
@@ -209,68 +448,137 @@ RAHSKILL
 
 # Ensure a persistent ssh master connection at $socket. Returns non-zero on failure.
 _ensure_master() {
-  local host="$1" socket="$2"
-  ssh -S "$socket" -O check "$host" 2>/dev/null && return 0
-  ssh -M -S "$socket" -o ControlPersist=600 -fN "$host"
+  local host="$1" socket="$2" port="${3:-}" ssh_args=()
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && return 0
+  ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host"
 }
 
-# Mount remote_path at mp (same path). Re-establishes master, clears a stale mount,
+# Mount remote_path at mp. Re-establishes master, clears a stale mount,
 # and skips work if already healthy. Returns sshfs's status.
 _do_mount() {
-  local host="$1" remote_path="$2" mp="$3" socket="$4"
-  _ensure_master "$host" "$socket" || return 1
+  local host="$1" remote_path="$2" mp="$3" socket="$4" port="${5:-}" sshfs_args=()
+  [ -n "$port" ] && sshfs_args=(-p "$port")
+  _ensure_master "$host" "$socket" "$port" || return 1
   if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
     _mount_alive "$mp" && return 0               # already mounted & healthy
     fusermount -uz "$mp" 2>/dev/null || true     # stale -> clear before remount
   fi
-  sshfs "$host:$remote_path" "$mp" \
+  sshfs "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
     -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath="$socket"
 }
 
 # ---------- mount ----------
 
 cmd_mount() {
-  local name="" prelude="" target=""
+  local name="" prelude="" target="" local_arg="" port="" same_path=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --name)    name="$2"; shift 2 ;;
       --prelude) prelude="$2"; shift 2 ;;
+      --local)   local_arg="$2"; shift 2 ;;
+      --port)    port="$2"; shift 2 ;;
+      --same-path) same_path=1; shift ;;
       --*)       _die "unknown option: $1" ;;
-      *)         target="$1"; shift ;;
+      *)
+        if [ -z "$target" ]; then
+          target="$1"
+        elif [ -z "$local_arg" ]; then
+          local_arg="$1"
+        else
+          _die "too many arguments: $1"
+        fi
+        shift ;;
     esac
   done
-  [ -n "$target" ] || _die "usage: rah mount [--name N] [--prelude CMD] user@host:/abs/path"
+  [ -n "$target" ] || _die "usage: rah mount [--name N] [--prelude CMD] user@host:/path [local-path]"
+  [ "$same_path" -eq 0 ] || [ -z "$local_arg" ] || _die "--same-path cannot be combined with a local path"
+  case "$port" in ""|*[!0-9]*) [ -z "$port" ] || _die "--port must be numeric: $port" ;; esac
 
-  local host="${target%%:*}" remote_path="${target#*:}"
-  case "$remote_path" in /*) ;; *) _die "remote path must be absolute: $remote_path" ;; esac
-  [ -n "$name" ] || name="$(printf '%s' "${host##*@}_${remote_path##*/}" | tr -c 'A-Za-z0-9_.-' '_')"
-
-  local mountpoint="$remote_path"                 # same-path: no translation
-  local socket="$HOME/.ssh/cm-${host##*@}"
-
-  mkdir -p "$RAH_CONFIG_DIR"
-  if ! mkdir -p "$mountpoint" 2>/dev/null; then
-    _die "cannot create mountpoint $mountpoint. Run once:
-  sudo mkdir -p $mountpoint && sudo chown $USER: $mountpoint"
+  case "$target" in *:*) ;; *) _die "expected user@host:/path or user@host:~/path, got: $target" ;; esac
+  local host="${target%%:*}" remote_raw="${target#*:}" remote_path
+  if ! _ssh_ok "$host" "$port"; then
+    _explain_ssh_failure "$host" "$port"
+    _die "fix ssh for '$host', then retry rah mount"
   fi
+  if ! remote_path="$(_resolve_remote_path "$host" "$remote_raw" "$port")"; then
+    _die "remote path must be absolute or ~/relative: $remote_raw"
+  fi
+  remote_path="$(_trim_trailing_slashes "$remote_path")"
 
-  _do_mount "$host" "$remote_path" "$mountpoint" "$socket" || _die "mount failed (host $host)"
+  [ -n "$name" ] || name="$(_default_mount_name "$host" "$remote_path")"
+  mkdir -p "$RAH_CONFIG_DIR"
 
   local cfg="$RAH_CONFIG_DIR/$name.env"
+  local mountpoint mode="mapped" cfg_host cfg_remote cfg_port cfg_mode
+  if [ "$same_path" -eq 1 ]; then
+    local_arg="$remote_path"
+    mode="same-path"
+  else
+    if [ -z "$local_arg" ]; then
+      if [ -f "$cfg" ]; then
+        cfg_host="$(_get "$cfg" host)"
+        cfg_remote="$(_get "$cfg" remote_path)"
+        cfg_port="$(_get "$cfg" ssh_port)"
+        if [ "$cfg_host" = "$host" ] && [ "$cfg_remote" = "$remote_path" ] && [ "$cfg_port" = "$port" ]; then
+          local_arg="$(_get "$cfg" mountpoint)"
+          cfg_mode="$(_get "$cfg" mode)"
+          [ -n "$cfg_mode" ] && mode="$cfg_mode"
+        fi
+      fi
+      [ -n "$local_arg" ] || local_arg="$(_default_mountpoint "$host" "$remote_path")"
+    fi
+  fi
+  mountpoint="$(_expand_local_path "$local_arg")"
+  local socket="$(_socket_for_host "$host" "$port")"
+
+  local owner_cfg owner_host owner_remote owner_port
+  if timeout 3 mountpoint -q "$mountpoint" 2>/dev/null; then
+    if owner_cfg="$(_config_for_mountpoint_exact "$mountpoint")"; then
+      owner_host="$(_get "$owner_cfg" host)"
+      owner_remote="$(_get "$owner_cfg" remote_path)"
+      owner_port="$(_get "$owner_cfg" ssh_port)"
+      if [ "$owner_host" != "$host" ] || [ "$owner_remote" != "$remote_path" ] || [ "$owner_port" != "$port" ]; then
+        _die "local mountpoint already belongs to another rah mount: $mountpoint
+  existing: $owner_host:$owner_remote${owner_port:+ port $owner_port}
+  choose a different local path."
+      fi
+    else
+      _die "local mountpoint is already mounted but not managed by rah: $mountpoint
+  choose a different local path."
+    fi
+  fi
+
+  mountpoint="$(_prepare_mountpoint "$mountpoint" 0)" || exit 1
+  [ "$mountpoint" = "$remote_path" ] && mode="same-path"
+
+  _do_mount "$host" "$remote_path" "$mountpoint" "$socket" "$port" || _die "mount failed (host $host)"
+
   {
     printf 'host=%s\n'           "$host"
     printf 'remote_path=%s\n'    "$remote_path"
     printf 'mountpoint=%s\n'     "$mountpoint"
+    printf 'mode=%s\n'           "$mode"
     printf 'control_socket=%s\n' "$socket"
+    printf 'ssh_port=%s\n'       "$port"
     printf 'prelude=%s\n'        "$prelude"
   } > "$cfg"
-  echo "rah: mounted $host:$remote_path at $mountpoint (config: $cfg)"
+  _say_ok "mounted $name"
+  _say_note "remote: $host:$remote_path${port:+ port $port}"
+  _say_note "local:  $mountpoint [$mode]"
+  _say_note "config: $cfg"
 }
 
 cmd_remount() {
-  local names=() cfg name host remote_path mp socket
+  local names=() cfg name host remote_path mp socket port arg
   if [ $# -gt 0 ]; then
-    names=("$@")
+    for arg in "$@"; do
+      if cfg="$(_cfg_from_arg_or_cwd "$arg" 2>/dev/null)"; then
+        names+=("$(basename "$cfg" .env)")
+      else
+        names+=("$arg")
+      fi
+    done
   else
     while IFS= read -r cfg; do [ -n "$cfg" ] && names+=("$(basename "$cfg" .env)"); done < <(_list_configs)
   fi
@@ -279,10 +587,11 @@ cmd_remount() {
     cfg="$RAH_CONFIG_DIR/$name.env"
     [ -f "$cfg" ] || { echo "rah: no such mount: $name" >&2; continue; }
     host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
-    mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"
+    mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
     fusermount -uz "$mp" 2>/dev/null || true
-    if _do_mount "$host" "$remote_path" "$mp" "$socket"; then
-      echo "rah: remounted $name ($mp)"
+    if _do_mount "$host" "$remote_path" "$mp" "$socket" "$port"; then
+      _say_ok "remounted $name"
+      _say_note "local: $mp"
     else
       echo "rah: remount failed for $name" >&2
     fi
@@ -290,17 +599,56 @@ cmd_remount() {
 }
 
 cmd_unmount() {
-  local name="${1:-}"
-  [ -n "$name" ] || _die "usage: rah unmount <name>"
-  local cfg="$RAH_CONFIG_DIR/$name.env"
-  [ -f "$cfg" ] || _die "no such mount: $name"
-  local mp host socket
-  mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"
+  local target="${1:-}" cfg name
+  [ -n "$target" ] || _die "usage: rah unmount <name|path>"
+  if ! cfg="$(_cfg_from_arg_or_cwd "$target")"; then
+    _die "no such mount: $target"
+  fi
+  name="$(basename "$cfg" .env)"
+  local mp host socket port ssh_args=()
+  mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
+  [ -n "$port" ] && ssh_args=(-p "$port")
   if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
     fusermount -uz "$mp" || _die "fusermount failed for $mp"
   fi
-  ssh -S "$socket" -O exit "$host" 2>/dev/null || true
-  echo "rah: unmounted $name"
+  ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
+  _say_ok "unmounted $name"
+}
+
+cmd_remove() {
+  local keep_local=0 target="" cfg name mp host socket port ssh_args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep-local) keep_local=1; shift ;;
+      --*) _die "usage: rah remove [--keep-local] <name|path>" ;;
+      *)
+        [ -z "$target" ] || _die "usage: rah remove [--keep-local] <name|path>"
+        target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || target="$PWD"
+  if ! cfg="$(_cfg_from_arg_or_cwd "$target")"; then
+    _die "no such mount: $target"
+  fi
+
+  name="$(basename "$cfg" .env)"
+  mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+    fusermount -uz "$mp" || _die "fusermount failed for $mp"
+    _say_ok "unmounted $name"
+  fi
+  ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
+  rm -f "$cfg"
+  _say_ok "removed config $name"
+
+  if [ "$keep_local" -eq 0 ] && [ -d "$mp" ]; then
+    if rmdir "$mp" 2>/dev/null; then
+      _say_ok "removed empty mountpoint $mp"
+    else
+      _say_warn "kept local directory (not empty): $mp"
+    fi
+  fi
 }
 
 # ---------- run (routing core) ----------
@@ -323,24 +671,28 @@ cmd_run() {
   fi
   [ -n "$cmd" ] || _die "run: empty command"
   [ -n "$cwd" ] || cwd="$PWD"
+  cwd="$(_expand_local_path "$cwd")"
 
   local cfg
   if ! cfg="$(_config_for_cwd "$cwd")"; then
     # Not under any managed mount -> run locally (safety fallthrough).
     bash -c "$cmd"; exit $?
   fi
-  local host socket prelude
-  host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; prelude="$(_get "$cfg" prelude)"
+  local host socket prelude remote_cwd port ssh_args=()
+  host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; prelude="$(_get "$cfg" prelude)"; port="$(_get "$cfg" ssh_port)"
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  remote_cwd="$(_remote_cwd "$cfg" "$cwd")"
+  cmd="$(_translate_command_paths "$cfg" "$cmd")"
 
-  _ensure_master "$host" "$socket" 2>/dev/null || true   # self-heal a dead master
+  _ensure_master "$host" "$socket" "$port" 2>/dev/null || true   # self-heal a dead master
 
   local b64 pre=""
   b64="$(printf '%s' "$cmd" | base64 -w0)"
   [ -n "$prelude" ] && pre="{ $prelude; } && "
 
-  local remote="cd $(_shq "$cwd") && ${pre}printf %s $(_shq "$b64") | base64 -d | bash"
+  local remote="cd $(_shq "$remote_cwd") && ${pre}printf %s $(_shq "$b64") | base64 -d | bash"
   set +e
-  ssh -S "$socket" "$host" "$remote"
+  ssh "${ssh_args[@]}" -S "$socket" "$host" "$remote"
   local rc=$?
   set -e
   exit $rc
@@ -368,10 +720,14 @@ cmd_hook() {
   reported_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
   tool_cwd="$(printf '%s' "$input" | jq -r '.tool_input.cwd // empty' 2>/dev/null)"
   cwd="$reported_cwd"
+  [ -n "$cwd" ] || cwd="$tool_cwd"
   [ -n "$cwd" ] || cwd="$PWD"
 
   local passthrough=0 cfg="" matched=0 reason=""
   if cfg="$(_config_for_cwd "$cwd" 2>/dev/null)"; then
+    matched=1
+  elif [ -n "$tool_cwd" ] && cfg="$(_config_for_cwd "$tool_cwd" 2>/dev/null)"; then
+    cwd="$tool_cwd"
     matched=1
   else
     passthrough=1
@@ -438,25 +794,27 @@ cmd_hook() {
 
 cmd_hook_log() {
   local action="${1:-status}" path="${2:-}"
-  case "$action" in
-    on)
-      [ -n "$path" ] || path="$RAH_HOOK_LOG_DEFAULT"
-      mkdir -p "$RAH_CONFIG_DIR" "$(dirname "$path")"
-      printf '%s\n' "$path" > "$RAH_HOOK_LOG_FLAG"
-      : >> "$path" || _die "cannot write hook log: $path"
-      echo "rah: hook log enabled: $path"
-      ;;
-    off)
-      rm -f "$RAH_HOOK_LOG_FLAG"
-      echo "rah: hook log disabled"
-      ;;
-    status|path)
-      if path="$(_hook_log_path)"; then
-        echo "rah: hook log enabled: $path"
-      else
-        echo "rah: hook log disabled"
-      fi
-      ;;
+	  case "$action" in
+	    on)
+	      [ -n "$path" ] || path="$RAH_HOOK_LOG_DEFAULT"
+	      mkdir -p "$RAH_CONFIG_DIR" "$(dirname "$path")"
+	      printf '%s\n' "$path" > "$RAH_HOOK_LOG_FLAG"
+	      : >> "$path" || _die "cannot write hook log: $path"
+	      _say_ok "hook log enabled"
+	      _say_note "$path"
+	      ;;
+	    off)
+	      rm -f "$RAH_HOOK_LOG_FLAG"
+	      _say_ok "hook log disabled"
+	      ;;
+	    status|path)
+	      if path="$(_hook_log_path)"; then
+	        _say_ok "hook log enabled"
+	        _say_note "$path"
+	      else
+	        _say_note "hook log disabled"
+	      fi
+	      ;;
     clear)
       if [ -n "$path" ]; then
         :
@@ -464,11 +822,12 @@ cmd_hook_log() {
         :
       else
         path="$RAH_HOOK_LOG_DEFAULT"
-      fi
-      mkdir -p "$(dirname "$path")"
-      : > "$path" || _die "cannot clear hook log: $path"
-      echo "rah: hook log cleared: $path"
-      ;;
+	      fi
+	      mkdir -p "$(dirname "$path")"
+	      : > "$path" || _die "cannot clear hook log: $path"
+	      _say_ok "hook log cleared"
+	      _say_note "$path"
+	      ;;
     *)
       _die "usage: rah hook-log on [path] | off | status | clear [path]"
       ;;
@@ -479,13 +838,13 @@ cmd_hook_log() {
 
 _ensure_path() {
   mkdir -p "$RAH_BIN_DIR"
-  local self target="$RAH_BIN_DIR/rah"; self="$(_self_path)"
-  [ "$self" = "$target" ] || ln -sf "$self" "$target"
-  case ":$PATH:" in
-    *":$RAH_BIN_DIR:"*) ;;
-    *) echo "rah: note — add $RAH_BIN_DIR to your PATH" ;;
-  esac
-}
+	  local self target="$RAH_BIN_DIR/rah"; self="$(_self_path)"
+	  [ "$self" = "$target" ] || ln -sf "$self" "$target"
+	  case ":$PATH:" in
+	    *":$RAH_BIN_DIR:"*) ;;
+	    *) _say_warn "add $RAH_BIN_DIR to your PATH" ;;
+	  esac
+	}
 
 # True if the rah hook is already registered in a JSON agent config file.
 _hook_present() {
@@ -525,18 +884,19 @@ _remove_hook_json() {
 
 _init_agent() {
   local label="$1" home="$2" cfg="$3" skilldir="$4" remove="$5" hookcmd="$6" matcher="$7"
-  if [ "$remove" -eq 1 ]; then
-    _remove_hook_json "$cfg"
-    rm -rf "$skilldir"
-    echo "rah: removed $label hook + skill"
-  else
-    _ensure_path
-    mkdir -p "$home" "$skilldir"
-    _merge_hook_json "$cfg" "$hookcmd" "$matcher"
-    _skill_doc > "$skilldir/SKILL.md"
-    echo "rah: $label hook + skill installed ($home)"
-  fi
-}
+	  if [ "$remove" -eq 1 ]; then
+	    _remove_hook_json "$cfg"
+	    rm -rf "$skilldir"
+	    _say_ok "removed $label hook + skill"
+	  else
+	    _ensure_path
+	    mkdir -p "$home" "$skilldir"
+	    _merge_hook_json "$cfg" "$hookcmd" "$matcher"
+	    _skill_doc > "$skilldir/SKILL.md"
+	    _say_ok "$label hook + skill installed"
+	    _say_note "$home"
+	  fi
+	}
 
 cmd_init() {
   local agent="" remove=0
@@ -557,104 +917,167 @@ cmd_init() {
 # ---------- setup (one-command guided onboarding) ----------
 
 cmd_setup() {
-  local target="" prelude="" prelude_set=0
+  local target="" local_arg="" prelude="" prelude_set=0 port="" same_path=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --prelude) prelude="$2"; prelude_set=1; shift 2 ;;
       -y|--yes)  RAH_YES=1; shift ;;
+      --local)   local_arg="$2"; shift 2 ;;
+      --port)    port="$2"; shift 2 ;;
+      --same-path) same_path=1; shift ;;
       --*)       _die "unknown option: $1" ;;
-      *)         target="$1"; shift ;;
+      *)
+        if [ -z "$target" ]; then
+          target="$1"
+        elif [ -z "$local_arg" ]; then
+          local_arg="$1"
+        else
+          _die "too many arguments: $1"
+        fi
+        shift ;;
     esac
-  done
+	  done
+	  [ "$same_path" -eq 0 ] || [ -z "$local_arg" ] || _die "--same-path cannot be combined with a local path"
 
-  echo "== rah setup =="
+	  _say_header "rah setup"
+	  local setup_state
+	  setup_state="$(mktemp)"
+	  _setup_collect_target "$target" "$port" "$setup_state"
+	  target="$(_get "$setup_state" target)"
+	  port="$(_get "$setup_state" port)"
+	  rm -f "$setup_state"
 
-  # 1) Dependencies — in a terminal, offer to install the missing ones.
-  local missing; missing="$(_missing_pkgs)"
-  if [ -n "$missing" ]; then
-    echo "missing dependencies: $missing"
-    if command -v apt-get >/dev/null 2>&1 && _confirm "install them now with sudo apt-get?"; then
-      sudo apt-get update -qq && sudo apt-get install -y $missing || _die "apt install failed"
-      missing="$(_missing_pkgs)"; [ -z "$missing" ] || _die "still missing: $missing"
-    else
-      _die "install these first: $missing"
-    fi
-  fi
-  echo "deps: ok"
+	  # 1) Dependencies — in a terminal, offer to install the missing ones.
+	  _say_header "Dependencies"
+	  local missing; missing="$(_missing_pkgs)"
+	  if [ -n "$missing" ]; then
+	    _say_warn "missing packages: $missing"
+	    _say_cmd "sudo apt-get update -qq && sudo apt-get install -y $missing"
+	    if command -v apt-get >/dev/null 2>&1 && _confirm "install them now with sudo apt-get?"; then
+	      sudo apt-get update -qq && sudo apt-get install -y $missing || _die "apt install failed"
+	      missing="$(_missing_pkgs)"; [ -z "$missing" ] || _die "still missing: $missing"
+	    else
+	      _die "install these first: $missing"
+	    fi
+	  fi
+	  _say_ok "all required commands are available"
 
-  # 2) Wire whichever agents are installed (idempotent); note if a hook was newly added.
-  local a adir cfgfile newly=0
-  for a in claude codex; do
-    adir="$HOME/.$a"; [ -d "$adir" ] || continue
-    cfgfile="$adir/settings.json"; [ "$a" = codex ] && cfgfile="$adir/hooks.json"
-    _hook_present "$cfgfile" || newly=1
-    cmd_init "$a" >/dev/null
-    echo "agent: $a wired"
-  done
+	  # 2) Wire whichever agents are installed (idempotent); note if a hook was newly added.
+	  _say_header "Agent hooks"
+	  local a adir cfgfile newly=0 agents_seen=0
+	  for a in claude codex; do
+	    adir="$HOME/.$a"; [ -d "$adir" ] || continue
+	    agents_seen=1
+	    cfgfile="$adir/settings.json"; [ "$a" = codex ] && cfgfile="$adir/hooks.json"
+	    _hook_present "$cfgfile" || newly=1
+	    cmd_init "$a" >/dev/null
+	    _say_ok "$a hook + skill wired"
+	  done
+	  [ "$agents_seen" -eq 1 ] || _say_warn "no Claude/Codex config directory found yet; run 'rah init claude' or 'rah init codex' after installing the agent"
 
-  # 3) Remote target (the one irreducible input).
-  [ -n "$target" ] || target="$(_prompt 'remote to mount (user@host:/abs/path): ')"
-  [ -n "$target" ] || _die "no remote given"
-  case "$target" in *:/*) ;; *) _die "expected user@host:/abs/path, got: $target" ;; esac
-  local host="${target%%:*}" remote_path="${target#*:}"
+	  # 3) Remote target.
+	  local host="${target%%:*}" remote_raw="${target#*:}" remote_path=""
 
-  # 4) SSH must be passwordless. In a terminal, offer to generate + authorize a key;
-  #    otherwise (e.g. an agent invoked us) print the one human step and stop.
-  if ! _ssh_ok "$host"; then
-    echo "passwordless ssh to '$host' isn't set up yet."
-    if _interactive; then
-      if ! ls "$HOME"/.ssh/id_*.pub >/dev/null 2>&1; then
-        if _confirm "no ssh key found — generate one (ssh-keygen ed25519)?"; then
-          ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519"
+	  # 4) SSH must be passwordless. In a terminal, offer to generate + authorize a key;
+	  #    otherwise (e.g. an agent invoked us) print the one human step and stop.
+	  _say_header "SSH"
+	  if ! _ssh_ok "$host" "$port"; then
+	    _say_warn "ssh preflight for '$host${port:+:$port}' failed"
+	    _ssh_failure_details "$host" "$port" | sed 's/^/  ssh: /'
+	    if _interactive; then
+	      if ! ls "$HOME"/.ssh/id_*.pub >/dev/null 2>&1; then
+	        if _confirm "no ssh key found — generate one (ssh-keygen ed25519)?"; then
+	          ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519"
         fi
       fi
-      if _confirm "authorize your key on $host now? (you'll enter the remote password once)"; then
-        ssh-copy-id "$host" || true
+	      if _confirm "authorize your key on $host now? (you'll enter the remote password once)"; then
+	        ssh-copy-id "$host" || true
+	      fi
+	      _ssh_ok "$host" "$port" || { _say_fail "still cannot use non-interactive ssh to $host"; _say_cmd "rah setup $target"; return 1; }
+	    else
+	      if [ -n "$port" ]; then
+	        _say_cmd "ssh -p $port -o BatchMode=yes -o ConnectTimeout=5 $host true"
+	      else
+	        _say_cmd "ssh -o BatchMode=yes -o ConnectTimeout=5 $host true"
+	      fi
+	      _say_note "if you normally use an ssh alias, use that alias in the rah target."
+	      return 1
+	    fi
+	  fi
+	  _say_ok "passwordless ssh works: $host${port:+:$port}"
+
+  if ! remote_path="$(_resolve_remote_path "$host" "$remote_raw" "$port")"; then
+    _die "remote path must be absolute or ~/relative: $remote_raw"
+  fi
+  remote_path="$(_trim_trailing_slashes "$remote_path")"
+
+  # 5) Local mountpoint. Default setup uses ~/mnt_rah/<project>;
+  # use --same-path only when identical local/remote absolute paths are intentional.
+  local mountpoint default_local ans="" default_name cfg cfg_host cfg_remote cfg_port
+  if [ "$same_path" -eq 1 ]; then
+    local_arg="$remote_path"
+  elif [ -z "$local_arg" ]; then
+    default_name="$(_default_mount_name "$host" "$remote_path")"
+    cfg="$RAH_CONFIG_DIR/$default_name.env"
+    if [ -f "$cfg" ]; then
+      cfg_host="$(_get "$cfg" host)"
+      cfg_remote="$(_get "$cfg" remote_path)"
+      cfg_port="$(_get "$cfg" ssh_port)"
+      if [ "$cfg_host" = "$host" ] && [ "$cfg_remote" = "$remote_path" ] && [ "$cfg_port" = "$port" ]; then
+        default_local="$(_get "$cfg" mountpoint)"
       fi
-      _ssh_ok "$host" || { echo "rah: still no passwordless ssh to $host — fix it, then: rah setup $target"; return 1; }
+    fi
+    [ -n "$default_local" ] || default_local="$(_default_mountpoint "$host" "$remote_path")"
+    if _interactive; then
+      ans="$(_prompt "local mount directory [$default_local]: ")"
+      local_arg="${ans:-$default_local}"
     else
-      echo "  run once: ssh-copy-id $host    then re-run: rah setup $target"
-      return 1
+      local_arg="$default_local"
     fi
-  fi
-  echo "ssh: ok ($host)"
+	  fi
+	  mountpoint="$(_expand_local_path "$local_arg")"
+	  _say_header "Mount plan"
+	  _say_cmd "$(_setup_command_preview "$port" "$target" "$mountpoint" "$same_path" "$prelude_set" "$prelude")"
+	  _say_note "remote: $host:$remote_path${port:+ port $port}"
+	  _say_note "local:  $mountpoint"
+	  if ! mountpoint="$(_prepare_mountpoint "$mountpoint" 1)"; then
+	    _say_cmd "rah setup $target $local_arg"
+	    return 1
+	  fi
 
-  # 5) Same-path mountpoint — create with sudo if it needs root.
-  if ! mkdir -p "$remote_path" 2>/dev/null; then
-    if _confirm "mount path $remote_path needs root to create once — do it with sudo?"; then
-      sudo mkdir -p "$remote_path" && sudo chown "$USER": "$remote_path" || _die "could not create $remote_path"
-    else
-      echo "rah: run once: sudo mkdir -p $remote_path && sudo chown $USER: $remote_path"
-      echo "then re-run: rah setup $target"
-      return 1
-    fi
-  fi
+	  # 6) Best-effort prelude auto-probe.
+	  if [ "$prelude_set" = 0 ]; then
+    local socket="$(_socket_for_host "$host" "$port")" ssh_args=()
+	    [ -n "$port" ] && ssh_args=(-p "$port")
+	    _ensure_master "$host" "$socket" "$port" 2>/dev/null || true
+	    if ssh "${ssh_args[@]}" -S "$socket" "$host" "test -f $(_shq "$remote_path/.venv/bin/activate")" 2>/dev/null; then
+	      prelude="source .venv/bin/activate"
+	      _say_ok "detected .venv prelude"
+	      _say_note "$prelude"
+	    fi
+	  fi
 
-  # 6) Best-effort prelude auto-probe.
-  if [ "$prelude_set" = 0 ]; then
-    local socket="$HOME/.ssh/cm-${host##*@}"
-    _ensure_master "$host" "$socket" 2>/dev/null || true
-    if ssh -S "$socket" "$host" "test -f $(_shq "$remote_path/.venv/bin/activate")" 2>/dev/null; then
-      prelude="source .venv/bin/activate"; echo "prelude: detected .venv -> '$prelude'"
-    fi
-  fi
-
-  # 7) Mount + finish.
-  if [ -n "$prelude" ]; then cmd_mount --prelude "$prelude" "$target"; else cmd_mount "$target"; fi
-  echo
-  if [ "$newly" = 1 ]; then
-    echo "rah: hook newly installed — restart your agent ONCE so it loads."
-    echo "     (future mounts activate immediately, no restart needed.)"
-  else
-    echo "rah: ready — routing is live now, no restart needed."
-  fi
-  echo
-  echo "next:"
-  echo "  cd $remote_path"
-  echo "  rah verify"
-  echo "  codex   # or: claude"
-  echo "  then ask the agent to run: nvidia-smi"
-}
+	  # 7) Mount + finish.
+	  _say_header "Mount"
+	  if [ -n "$prelude" ]; then
+	    if [ -n "$port" ]; then cmd_mount --port "$port" --prelude "$prelude" "$target" "$mountpoint"; else cmd_mount --prelude "$prelude" "$target" "$mountpoint"; fi
+	  else
+	    if [ -n "$port" ]; then cmd_mount --port "$port" "$target" "$mountpoint"; else cmd_mount "$target" "$mountpoint"; fi
+	  fi
+	  echo
+	  if [ "$newly" = 1 ]; then
+	    _say_warn "hook newly installed; restart your agent once so it loads"
+	    _say_note "future mounts activate immediately, no restart needed."
+	  else
+	    _say_ok "routing is live now; no restart needed"
+	  fi
+	  echo
+	  _say_header "Next"
+	  _say_cmd "cd $mountpoint"
+	  _say_cmd "rah verify"
+	  _say_cmd "codex   # or: claude"
+	  _say_note "then ask the agent to run: nvidia-smi"
+	}
 
 # ---------- status / doctor ----------
 
@@ -662,31 +1085,35 @@ _agent_hook_status() {
   local label="$1" cfg="$2" expected_cmd="$3" expected_matcher="$4"
   printf '  %-10s ' "$label"
   if [ ! -f "$cfg" ]; then
-    echo "[not installed — run: rah init ${label,,}]"
+    printf '%b\n' "$(_tag_warn "not installed") run: rah init ${label,,}"
     return 1
   fi
   if jq -e --arg cmd "$expected_cmd" --arg matcher "$expected_matcher" '
       (.hooks.PreToolUse // [])
       | any(.[]; (.matcher // "") == $matcher and ((.hooks // []) | any(.command == $cmd)))
     ' "$cfg" >/dev/null 2>&1; then
-    echo "[installed]"
+    printf '%b\n' "$(_tag_ok "installed")"
     return 0
   fi
   if _hook_present "$cfg"; then
-    echo "[needs update — run: rah init ${label,,}]"
+    printf '%b\n' "$(_tag_warn "needs update") run: rah init ${label,,}"
   else
-    echo "[missing — run: rah init ${label,,}]"
+    printf '%b\n' "$(_tag_fail "missing") run: rah init ${label,,}"
   fi
   return 1
 }
 
 _cfg_from_arg_or_cwd() {
-  local arg="${1:-}" cfg="" count=0 last=""
+  local arg="${1:-}" cfg="" count=0 last="" local_arg=""
   if [ -n "$arg" ]; then
     if [ -f "$RAH_CONFIG_DIR/$arg.env" ]; then
       printf '%s\n' "$RAH_CONFIG_DIR/$arg.env"; return 0
     fi
     if cfg="$(_config_for_cwd "$arg" 2>/dev/null)"; then
+      printf '%s\n' "$cfg"; return 0
+    fi
+    local_arg="$(_expand_local_path "$arg")"
+    if cfg="$(_config_for_cwd "$local_arg" 2>/dev/null)"; then
       printf '%s\n' "$cfg"; return 0
     fi
     return 1
@@ -709,76 +1136,97 @@ _exec_plane_ok() {
 }
 
 cmd_status() {
-  local any=0 cfg name host mp socket state
-  echo "rah status (v$RAH_VERSION)"
+  local any=0 cfg name host remote_path mp socket state mode port
+  _say_header "rah status (v$RAH_VERSION)"
   while IFS= read -r cfg; do
     [ -n "$cfg" ] || continue
     any=1
     name="$(basename "$cfg" .env)"
-    host="$(_get "$cfg" host)"; mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"
-    printf '● %s\n' "$name"
+    host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
+    mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
+    mode="$(_get "$cfg" mode)"; [ -n "$mode" ] || mode="same-path"
+    printf '%b\n' "${RAH_BOLD}$name${RAH_RESET}"
     printf '  host:       %s\n' "$host"
-    printf '  mountpoint: %s ' "$mp"
+    [ -n "$port" ] && printf '  port:       %s\n' "$port"
+    printf '  remote:     %s\n' "$remote_path"
+    printf '  local:      %s [%s] ' "$mp" "$mode"
     state="$(_mount_state "$mp")"
     case "$state" in
-      mounted) printf '[mounted]\n' ;;
-      dead)    printf '[DEAD — run: rah remount %s]\n' "$name" ;;
-      *)       printf '[not mounted]\n' ;;
+      mounted) _tag_ok "mounted"; printf '\n' ;;
+      dead)    _tag_fail "DEAD"; printf ' run: rah remount %s\n' "$name" ;;
+      *)       _tag_warn "not mounted"; printf '\n' ;;
     esac
     printf '  ssh:        '
-    if _ssh_ok "$host"; then printf '[reachable]\n'; else printf '[NO passwordless ssh — run: ssh-copy-id %s]\n' "$host"; fi
+    if _ssh_ok "$host" "$port"; then _tag_ok "reachable"; printf '\n'; else _tag_fail "FAILED"; printf ' run: ssh%s -o BatchMode=yes %s true\n' "${port:+ -p $port}" "$host"; fi
     printf '  exec:       '
-    if _exec_plane_ok "$mp"; then printf '[remote ok]\n'; else printf '[FAILED — run: rah verify %s]\n' "$name"; fi
+    if _exec_plane_ok "$mp"; then _tag_ok "remote ok"; printf '\n'; else _tag_fail "FAILED"; printf ' run: rah verify %s\n' "$name"; fi
   done < <(_list_configs)
-  [ "$any" -eq 1 ] || echo "rah: no managed mounts (run: rah mount user@host:/abs/path)"
-  echo "agents:"
+  [ "$any" -eq 1 ] || _say_warn "no managed mounts; run: rah mount user@host:~/project"
+  _say_header "Agents"
   _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" || true
   _agent_hook_status "codex" "$HOME/.codex/hooks.json" "rah hook --decision allow --passthrough empty" "Bash|command_execution" || true
+  printf '  %-10s ' "hook-log"
   if _hook_log_path >/dev/null 2>&1; then
-    echo "  hook-log   [on — run: rah hook-log off]"
+    printf '%b\n' "$(_tag_ok "on") run: rah hook-log off"
   else
-    echo "  hook-log   [off]"
+    printf '%b\n' "$(_tag_note "off")"
   fi
 }
 
 cmd_verify() {
-  local target="${1:-}" cfg name host mp ok=1 out hook_out outside
+  local target="${1:-}" cfg name host remote_path mp port ok=1 out hook_out outside path_cmd path_b64
   if ! cfg="$(_cfg_from_arg_or_cwd "$target")"; then
     _die "verify: no target mount found (run inside a mount, or: rah verify <name|path>)"
   fi
   name="$(basename "$cfg" .env)"
-  host="$(_get "$cfg" host)"; mp="$(_get "$cfg" mountpoint)"
+  host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"; mp="$(_get "$cfg" mountpoint)"; port="$(_get "$cfg" ssh_port)"
 
-  echo "rah verify (v$RAH_VERSION) — $name"
+  _say_header "rah verify (v$RAH_VERSION) - $name"
   printf '  deps:       '
-  if [ -z "$(_missing_pkgs)" ]; then echo "[ok]"; else echo "[MISSING — run: rah doctor]"; ok=0; fi
+  if [ -z "$(_missing_pkgs)" ]; then _tag_ok "ok"; printf '\n'; else _tag_fail "MISSING"; printf ' run: rah doctor\n'; ok=0; fi
 
   printf '  mount:      '
   case "$(_mount_state "$mp")" in
-    mounted) echo "[mounted] $mp" ;;
-    dead)    echo "[DEAD — run: rah remount $name]"; ok=0 ;;
-    *)       echo "[not mounted — run: rah remount $name]"; ok=0 ;;
+    mounted) _tag_ok "mounted"; printf ' %s\n' "$mp" ;;
+    dead)    _tag_fail "DEAD"; printf ' run: rah remount %s\n' "$name"; ok=0 ;;
+    *)       _tag_warn "not mounted"; printf ' run: rah remount %s\n' "$name"; ok=0 ;;
   esac
 
   printf '  ssh:        '
-  if _ssh_ok "$host"; then echo "[reachable] $host"; else echo "[FAILED — run: ssh-copy-id $host]"; ok=0; fi
+  if _ssh_ok "$host" "$port"; then
+    _tag_ok "reachable"
+    if [ -n "$port" ]; then printf ' %s:%s\n' "$host" "$port"; else printf ' %s\n' "$host"; fi
+  else
+    _tag_fail "FAILED"; printf ' run: ssh%s -o BatchMode=yes %s true\n' "${port:+ -p $port}" "$host"
+    ok=0
+  fi
 
   printf '  exec:       '
-  if out="$(timeout 15 "$(_self_path)" run --cwd "$mp" -- printf rah-remote-ok 2>/dev/null)" && [ "$out" = "rah-remote-ok" ]; then
-    echo "[remote ok]"
+  if out="$(timeout 15 "$(_self_path)" run --cwd "$mp" -- pwd 2>/dev/null)" && [ "$out" = "$remote_path" ]; then
+    _tag_ok "remote ok"; printf '\n'
   else
-    echo "[FAILED — explicit rah run did not complete]"
+    _tag_fail "FAILED"; printf ' explicit rah run did not cd to %s\n' "$remote_path"
+    ok=0
+  fi
+
+  printf '  path map:   '
+  path_cmd="printf %s $(_shq "$mp")"
+  path_b64="$(printf '%s' "$path_cmd" | base64 -w0)"
+  if out="$(timeout 15 "$(_self_path)" run --cwd "$mp" --b64 "$path_b64" 2>/dev/null)" && [ "$out" = "$remote_path" ]; then
+    _tag_ok "ok"; printf '\n'
+  else
+    _tag_fail "FAILED"; printf ' local absolute path was not translated\n'
     ok=0
   fi
 
   printf '  hook route: '
   hook_out="$(jq -nc --arg cwd "$mp" --arg cmd "printf rah-hook-ok" \
       '{tool_name:"Bash",cwd:$cwd,tool_input:{command:$cmd}}' \
-    | "$(_self_path)" hook --decision allow --passthrough empty 2>/dev/null)"
+	    | "$(_self_path)" hook --decision allow --passthrough empty 2>/dev/null)"
   if printf '%s' "$hook_out" | jq -e '.hookSpecificOutput.permissionDecision == "allow" and (.hookSpecificOutput.updatedInput.command | startswith("rah run --cwd "))' >/dev/null 2>&1; then
-    echo "[ok]"
+    _tag_ok "ok"; printf '\n'
   else
-    echo "[FAILED — hook did not rewrite a managed cwd]"
+    _tag_fail "FAILED"; printf ' hook did not rewrite a managed cwd\n'
     ok=0
   fi
 
@@ -786,30 +1234,30 @@ cmd_verify() {
   outside="$(mktemp -d)"
   hook_out="$(jq -nc --arg cwd "$outside" --arg cmd "printf local-ok" \
       '{tool_name:"Bash",cwd:$cwd,tool_input:{command:$cmd}}' \
-    | "$(_self_path)" hook --decision allow --passthrough empty 2>/dev/null)"
+	    | "$(_self_path)" hook --decision allow --passthrough empty 2>/dev/null)"
   rmdir "$outside" 2>/dev/null || true
-  if [ -z "$hook_out" ]; then echo "[ok]"; else echo "[FAILED — Codex passthrough was not empty]"; ok=0; fi
+  if [ -z "$hook_out" ]; then _tag_ok "ok"; printf '\n'; else _tag_fail "FAILED"; printf ' Codex passthrough was not empty\n'; ok=0; fi
 
   printf '  claude:     '
   if _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" >/dev/null; then
-    echo "[hook installed]"
+    _tag_ok "hook installed"; printf '\n'
   else
-    echo "[not ready — run: rah init claude]"
+    _tag_warn "not ready"; printf ' run: rah init claude\n'
     ok=0
   fi
 
   printf '  codex:      '
   if _agent_hook_status "codex" "$HOME/.codex/hooks.json" "rah hook --decision allow --passthrough empty" "Bash|command_execution" >/dev/null; then
-    echo "[hook installed]"
+    _tag_ok "hook installed"; printf '\n'
   else
-    echo "[not ready — run: rah init codex]"
+    _tag_warn "not ready"; printf ' run: rah init codex\n'
     ok=0
   fi
 
   if [ "$ok" -eq 1 ]; then
-    echo "rah: verify passed"
+    _say_ok "verify passed"
   else
-    echo "rah: verify found issues"
+    _say_fail "verify found issues"
     return 1
   fi
 }
@@ -817,30 +1265,34 @@ cmd_verify() {
 _check_dep() {  # name pkg required(0|1) ; prints status, returns non-zero if missing
   local bin="$1" pkg="$2" required="$3"
   printf '  %-12s ' "$bin"
-  if command -v "$bin" >/dev/null 2>&1; then echo "[ok]"; return 0; fi
-  [ "$required" -eq 1 ] && echo "[MISSING — apt install $pkg]" || echo "[optional — apt install $pkg]"
+  if command -v "$bin" >/dev/null 2>&1; then _tag_ok "ok"; printf '\n'; return 0; fi
+  if [ "$required" -eq 1 ]; then
+    _tag_fail "MISSING"; printf ' apt install %s\n' "$pkg"
+  else
+    _tag_warn "optional"; printf ' apt install %s\n' "$pkg"
+  fi
   return 1
 }
 
 cmd_doctor() {
   local ok=1 d
-  echo "rah doctor (v$RAH_VERSION)"
+  _say_header "rah doctor (v$RAH_VERSION)"
   for d in "${RAH_DEPS[@]}"; do _check_dep "${d%%:*}" "${d#*:}" 1 || ok=0; done
   if command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1; then
-    printf '  %-12s [ok]\n' fusermount
+    printf '  %-12s ' fusermount; _tag_ok "ok"; printf '\n'
   else
-    printf '  %-12s [MISSING — apt install fuse3]\n' fusermount; ok=0
+    printf '  %-12s ' fusermount; _tag_fail "MISSING"; printf ' apt install fuse3\n'; ok=0
   fi
   _check_dep curl       curl           0 || true
   printf '  %-12s ' PATH
   case ":$PATH:" in
-    *":$RAH_BIN_DIR:"*) echo "[$RAH_BIN_DIR on PATH]" ;;
-    *) echo "[$RAH_BIN_DIR NOT on PATH — add it]" ;;
+    *":$RAH_BIN_DIR:"*) _tag_ok "$RAH_BIN_DIR on PATH"; printf '\n' ;;
+    *) _tag_warn "$RAH_BIN_DIR NOT on PATH"; printf ' add it\n' ;;
   esac
   local any=0 cfg
   while IFS= read -r cfg; do [ -n "$cfg" ] && any=1; done < <(_list_configs)
-  [ "$any" -eq 1 ] && { echo "  mounts:"; cmd_status | sed 's/^/    /'; }
-  [ "$ok" -eq 1 ] && echo "rah: all required dependencies present" || _die "missing required dependencies (see above)"
+  [ "$any" -eq 1 ] && { _say_header "Mounts"; cmd_status | sed 's/^/  /'; }
+  [ "$ok" -eq 1 ] && _say_ok "all required dependencies present" || _die "missing required dependencies (see above)"
 }
 
 # ---------- self-update / uninstall ----------
@@ -848,13 +1300,15 @@ cmd_doctor() {
 cmd_self_update() {
   command -v curl >/dev/null 2>&1 || _die "curl required for self-update"
   local dest tmp newver; dest="$(_self_path)"; tmp="$(mktemp)"
-  echo "rah: fetching $RAH_RAW_URL"
+  _say_header "Self-update"
+  _say_note "fetching $RAH_RAW_URL"
   curl -fsSL "$RAH_RAW_URL" -o "$tmp" || { rm -f "$tmp"; _die "download failed"; }
   head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || { rm -f "$tmp"; _die "downloaded file does not look like rah"; }
   newver="$(sed -n 's/^RAH_VERSION="\(.*\)"/\1/p' "$tmp" | head -1)"
   [ -n "$newver" ] || { rm -f "$tmp"; _die "downloaded file missing version marker"; }
   chmod +x "$tmp"; mv "$tmp" "$dest"
-  echo "rah: updated $dest ($RAH_VERSION -> $newver)"
+  _say_ok "updated $dest"
+  _say_note "$RAH_VERSION -> $newver"
 }
 
 cmd_uninstall() {
@@ -865,17 +1319,17 @@ cmd_uninstall() {
     [ -n "$cfg" ] || continue
     name="$(basename "$cfg" .env)"
     cmd_unmount "$name" 2>/dev/null || true
-  done < <(_list_configs)
-  _remove_hook_json "$HOME/.claude/settings.json"; rm -rf "$HOME/.claude/skills/rah"
-  _remove_hook_json "$HOME/.codex/hooks.json";     rm -rf "$HOME/.codex/skills/rah"
-  echo "rah: removed hooks + skills from ~/.claude and ~/.codex"
-  [ -e "$RAH_BIN_DIR/rah" ] && { rm -f "$RAH_BIN_DIR/rah"; echo "rah: removed $RAH_BIN_DIR/rah"; }
-  if [ "$purge" -eq 1 ]; then
-    rm -rf "$RAH_CONFIG_DIR"; echo "rah: purged $RAH_CONFIG_DIR"
-  else
-    echo "rah: kept configs in $RAH_CONFIG_DIR (use --purge to remove)"
-  fi
-}
+	  done < <(_list_configs)
+	  _remove_hook_json "$HOME/.claude/settings.json"; rm -rf "$HOME/.claude/skills/rah"
+	  _remove_hook_json "$HOME/.codex/hooks.json";     rm -rf "$HOME/.codex/skills/rah"
+	  _say_ok "removed hooks + skills from ~/.claude and ~/.codex"
+	  [ -e "$RAH_BIN_DIR/rah" ] && { rm -f "$RAH_BIN_DIR/rah"; _say_ok "removed $RAH_BIN_DIR/rah"; }
+	  if [ "$purge" -eq 1 ]; then
+	    rm -rf "$RAH_CONFIG_DIR"; _say_ok "purged $RAH_CONFIG_DIR"
+	  else
+	    _say_note "kept configs in $RAH_CONFIG_DIR (use --purge to remove)"
+	  fi
+	}
 
 # ---------- dispatch ----------
 
@@ -883,16 +1337,20 @@ _usage() {
   cat <<EOF
 rah — Remote as Host (v$RAH_VERSION)
 
-  rah setup [user@host:/abs/path] [--prelude CMD] [-y]       guided onboarding (interactive: deps/ssh/mount)
-  rah mount [--name N] [--prelude CMD] user@host:/abs/path   mount remote code tree (same path)
-  rah remount [name]                                         recover a dead mount (all if no name)
-  rah unmount <name>                                         unmount + drop ssh master
+  rah setup [--port PORT] [user@host:/path] [local-path] [--prelude CMD] [-y]
+                                                               guided onboarding (deps/ssh/agent/mount)
+  rah mount [--name N] [--port PORT] [--prelude CMD] user@host:/path [local-path]
+                                                               mount remote code tree locally
+  rah mount --same-path user@host:/abs/path                    use identical local/remote path mode
+  rah remount [name|path]                                    recover a dead mount (all if no target)
+  rah unmount <name|path>                                    unmount + drop ssh master, keep config
+  rah remove [--keep-local] [name|path]                      unmount + remove config; rmdir empty mountpoint
   rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
   rah hook [--decision defer|allow|ask] [--passthrough defer|empty]
                                                                 PreToolUse rewrite (reads JSON on stdin)
   rah hook-log on [path] | off | status | clear [path]       enable/inspect hook diagnostics
   rah init <claude|codex> [--remove]                         install/remove hook + skill for an agent
-  rah status                                                 show mount / ssh / exec / agent-hook health
+  rah status | list                                          show mount / ssh / exec / agent-hook health
   rah verify [name|path]                                     end-to-end mount/ssh/hook check
   rah doctor                                                 check dependencies, PATH, mount health
   rah self-update                                            update rah to the latest version
@@ -908,11 +1366,12 @@ main() {
     mount)       cmd_mount "$@" ;;
     remount)     cmd_remount "$@" ;;
     unmount)     cmd_unmount "$@" ;;
+    remove|rm)   cmd_remove "$@" ;;
     run)         cmd_run "$@" ;;
     hook)        cmd_hook "$@" ;;
     hook-log)    cmd_hook_log "$@" ;;
     init)        cmd_init "$@" ;;
-    status)      cmd_status "$@" ;;
+    status|list) cmd_status "$@" ;;
     verify)      cmd_verify "$@" ;;
     doctor)      cmd_doctor "$@" ;;
     self-update) cmd_self_update "$@" ;;

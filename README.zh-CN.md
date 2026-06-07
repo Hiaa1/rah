@@ -1,7 +1,11 @@
 # Remote as Host (rah)
 
+<p align="center">
+  <img src="assets/rah-logo.svg" alt="Rah logo - local agent with files mounted from a remote host and commands routed to it" width="720">
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.7-blue)](rah)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](rah)
 [![Bash](https://img.shields.io/badge/Bash-single_file-4EAA25?logo=gnubash&logoColor=white)](rah)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-verified-7C3AED)](README.zh-CN.md#agent-支持)
 [![Codex CLI](https://img.shields.io/badge/Codex_CLI-verified-111827)](README.zh-CN.md#agent-支持)
@@ -12,11 +16,23 @@
 agent 仍然运行在本地；真正的项目、代码、重数据集和 GPU 都留在远端。
 `rah` 给 agent 提供两个被强制执行的平面：
 
-- **文件面**：通过 **same-path sshfs mount** 编辑远端代码树，所以 agent 原生的读文件、改文件、grep 工具都能直接工作。数据集不会被挂载，仍留在远端，避免一次误搜索把大量数据拖到本地。
+- **文件面**：通过 **sshfs mount** 编辑远端代码树。默认挂到本机 `~/mnt_rah/<project>`，也可以指定任意空的本地目录。数据集不会被挂载，仍留在远端，避免一次误搜索把大量数据拖到本地。
 - **执行面**：通过 `PreToolUse` **hook** 把 agent 的 shell 命令透明改写到远端 ssh 执行。这个路由是确定性的，不靠提示词提醒模型。agent 的行为就像它真的在远端机器上一样。
 
 路由是 hook 强制的不变量，不是 prompt 里的请求，所以模型不会“忘记”在远端运行。
 **远端零安装**：只在本机安装 `rah`；远端只需要标准的 `sshd`、`bash` 和 `base64`。
+
+## 可信 Agent 网关
+
+`rah` 也支持一种更安全的 coding agent 账号模型：只在一台可信机器上登录 Claude Code / Codex，
+个人电脑通过你自己的远程访问方式连到这台机器；再由这台机器通过 `rah` 去操控任意 server 或 workstation。
+
+这样可以避免把 agent 登录态、浏览器会话、API token 和账号风险散落到多台个人设备上，尤其是多台设备使用不同 VPN 出口或网络位置时。
+agent 账号只留在一个地方；真正的项目执行仍然发生在正确的远端机器上。
+
+<p align="center">
+  <img src="assets/rah-seamless-dev.png" alt="Rah 让本地 coding agent 保持正常体验，同时由 hook 将命令路由到远端执行" width="900">
+</p>
 
 ## 安装
 
@@ -37,22 +53,35 @@ git clone https://github.com/Hiaa1/rah && cd rah && ./install.sh
 
 在任意 Claude Code / Codex 会话里，一句话就够：
 
-> **“Install rah from github.com/Hiaa1/rah and set it up for `you@host:/abs/path`.”**
+> **“Install rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`.”**
 
 agent 会按这个 README 操作：检查 passwordless ssh，如果缺失会引导你运行 `ssh-copy-id`
 （只需要那一次输入远端密码），安装 rah，并运行 `rah setup`。你只需要提供远端地址、完成一次 ssh 授权，并在第一次安装 hook 后重启 agent。
 
 ## 快速开始
 
-一条命令检查依赖、配置已安装的 agent，并挂载远端项目：
+一条命令进入引导式 setup。它会询问 ssh target、可选端口、远端项目路径、本地挂载目录，然后检查依赖、配置已安装的 agent、挂载，并打印实际执行的完整命令：
 
 ```bash
-rah setup you@host:/abs/path/to/project
+rah setup
 ```
 
-> **请在真实终端里运行 `rah setup`，不要在 coding agent 里运行。** 它会通过 `[Y/n]` 提示处理缺失前置条件：安装依赖（`sudo apt`）、生成并授权 ssh key（`ssh-copy-id`）、创建 same-path mount 目录（`sudo`）。这些步骤需要 TTY 来读取密码，而 coding agent 的 shell，包括 Claude Code 的 `!`，没有 TTY，所以会失败。加 `-y` 可以默认确认。无 TTY 运行时，`rah setup` 会检测到并打印需要人手执行的下一步，而不是卡住。
+脚本化或重复部署时，也可以显式传完整参数：
 
-> **无 sudo 试跑建议**：先挂载 `/tmp` 下的临时路径（本地和远端通常都可写）：`rah setup you@host:/tmp/rah-test`。这适合在接入真实项目路径前做第一次端到端验证。
+```bash
+rah setup you@host:~/project
+rah setup --port 27867 you@10.19.125.121:~/project
+```
+
+> **请在真实终端里运行 `rah setup`，不要在 coding agent 里运行。** 它会通过 `[Y/n]` 提示处理缺失前置条件：安装依赖（`sudo apt`）、生成并授权 ssh key（`ssh-copy-id`），或者在你指定的本地挂载目录需要 root 时创建目录（`sudo`）。这些步骤需要 TTY 来读取密码，而 coding agent 的 shell，包括 Claude Code 的 `!`，没有 TTY，所以会失败。加 `-y` 可以默认确认。无 TTY 运行时，`rah setup` 会检测到并打印需要人手执行的下一步，而不是卡住。
+
+默认本地挂载目录是 `~/mnt_rah/<project>`。如果想挂到自己指定的位置，直接把本地目录作为第二个参数：
+
+```bash
+rah setup you@host:~/project ~/Fyx/project
+```
+
+如果确实需要本地和远端绝对路径完全一致，可以显式使用 `--same-path`。
 
 第一次部署在终端完成；之后日常使用都在 agent 里完成，agent 不需要 TTY 或 `sudo`。
 
@@ -61,22 +90,24 @@ rah setup you@host:/abs/path/to/project
 把项目交给 agent 前，先做一次验收：
 
 ```bash
-cd /abs/path/to/project
+cd ~/mnt_rah/project
 rah verify
 ```
 
-偏好显式步骤的话：`rah doctor` -> `rah init claude`（或 `codex`）-> `rah mount user@host:/abs/path`。
+偏好显式步骤的话：`rah doctor` -> `rah init claude`（或 `codex`）-> `rah mount user@host:~/project ~/Fyx/project`。
 
 ## 命令
 
 | 命令 | 用途 |
 |---|---|
-| `rah setup [user@host:/abs/path] [-y]` | 引导式初始化：交互安装依赖、配置 ssh key、挂载 |
-| `rah mount [--name N] [--prelude CMD] user@host:/abs/path` | 把远端代码树挂载到完全相同的本地路径 |
-| `rah remount [name]` | 恢复失效或 stale mount，不传 name 则恢复全部 |
-| `rah unmount <name>` | 卸载并关闭 ssh master 连接 |
+| `rah setup [--port PORT] [user@host:/path] [local-path] [-y]` | 引导式初始化：依赖、ssh key、agent hook、挂载 |
+| `rah mount [--name N] [--port PORT] [--prelude CMD] user@host:/path [local-path]` | 把远端代码树挂到本地，默认 `~/mnt_rah/<project>` |
+| `rah mount --same-path user@host:/abs/path` | 显式使用本地/远端完全同路径模式 |
+| `rah remount [name\|path]` | 恢复失效或 stale mount，不传目标则恢复全部 |
+| `rah unmount <name\|path>` | 卸载并关闭 ssh master 连接，保留配置 |
+| `rah remove [--keep-local] [name\|path]` | 卸载、删除 rah 配置，并删除空的 mountpoint 目录；不传目标则使用当前 mount |
 | `rah init <claude\|codex> [--remove]` | 安装或移除 agent hook 和 skill |
-| `rah status` | 查看 mount / ssh / exec / agent hook 状态 |
+| `rah status` / `rah list` | 查看 mount / ssh / exec / agent hook 状态 |
 | `rah verify [name\|path]` | 端到端检查 mount、ssh、hook |
 | `rah doctor` | 检查依赖、PATH、mount 健康状态 |
 | `rah self-update` | 更新到最新版本 |
@@ -84,14 +115,26 @@ rah verify
 | `rah run --cwd <dir> -- <cmd>` | 在远端执行命令，hook 内部使用 |
 | `rah hook-log on\|off\|status\|clear` | 开启或查看 hook 诊断日志 |
 
+## Mount 管理
+
+用 `rah status` 或 `rah list` 查看所有受管理 mount，包括名称、远端路径、本地路径、mount 健康状态、ssh 连通性和执行面健康状态。
+
+- `rah unmount <name|path>` 只断开 mount，保留配置，之后可以用 `rah remount <name|path>` 恢复。
+- `rah remove [name|path]` 会断开 mount、删除 rah 配置，并且只在本地 mountpoint 为空时删除这个目录。
+- `rah remove --keep-local [name|path]` 删除 rah 配置，但保留本地目录。
+
 ## 工作原理
 
+<p align="center">
+  <img src="assets/rah-workflow.png" alt="Rah 工作流：远端文件挂载到本地，命令再路由回远端执行" width="900">
+</p>
+
 ```text
-agent file tools -> same-path sshfs mount -> remote code tree
+agent file tools -> local sshfs mount -> remote code tree
 agent commands -> PreToolUse hook -> rah run -> ssh(ControlMaster) -> remote: cd + prelude + cmd
 ```
 
-hook 按工作目录自门控：不在 rah 管理的 mount 内时，命令原样放行，所以全局安装也安全。命令以 base64 形式传到远端，避免 shell quoting 和注入问题；远端退出码会原样传播，agent 的运行和验证循环可以正常工作。独立的 `cd` 会保留在本地，以维持 agent 持久 shell 的 cwd。
+hook 按工作目录自门控：不在 rah 管理的 mount 内时，命令原样放行，所以全局安装也安全。命令以 base64 形式传到远端，避免 shell quoting 和注入问题；远端退出码会原样传播，agent 的运行和验证循环可以正常工作。在映射模式下，rah 会在远端执行前把本地 cwd 和命令里的本地绝对路径前缀翻译回远端项目路径。独立的 `cd` 会保留在本地，以维持 agent 持久 shell 的 cwd。
 
 ## 恢复
 

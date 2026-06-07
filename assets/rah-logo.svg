@@ -1,0 +1,76 @@
+<svg width="960" height="300" viewBox="0 0 960 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Rah - Remote as Host</title>
+  <desc id="desc">A local agent connected to a remote host through separate file mount and command execution lanes.</desc>
+  <defs>
+    <linearGradient id="panel" x1="80" y1="40" x2="880" y2="260" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#EEF6FF"/>
+    </linearGradient>
+    <linearGradient id="fileLane" x1="280" y1="116" x2="680" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22C55E"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+    <linearGradient id="execLane" x1="280" y1="174" x2="680" y2="174" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <filter id="softShadow" x="38" y="13" width="884" height="274" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <rect x="60" y="32" width="840" height="236" rx="30" fill="url(#panel)" filter="url(#softShadow)"/>
+  <rect x="60.5" y="32.5" width="839" height="235" rx="29.5" stroke="#CBD5E1"/>
+
+  <g transform="translate(98 92)">
+    <rect x="0" y="0" width="178" height="126" rx="18" fill="#111827"/>
+    <rect x="14" y="14" width="150" height="74" rx="10" fill="#020617"/>
+    <path d="M36 42L54 55L36 68" stroke="#38BDF8" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M71 70H116" stroke="#A7F3D0" stroke-width="8" stroke-linecap="round"/>
+    <rect x="48" y="101" width="82" height="12" rx="6" fill="#334155"/>
+    <path d="M68 113H110L121 126H57L68 113Z" fill="#64748B"/>
+    <text x="89" y="151" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="700" fill="#334155">local agent</text>
+  </g>
+
+  <g transform="translate(682 84)">
+    <rect x="0" y="0" width="182" height="144" rx="22" fill="#0F172A"/>
+    <rect x="18" y="18" width="146" height="108" rx="14" fill="#172033" stroke="#334155"/>
+    <rect x="38" y="36" width="68" height="66" rx="12" fill="#1E293B" stroke="#475569"/>
+    <path d="M53 58L65 68L53 78" stroke="#38BDF8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M75 80H95" stroke="#A7F3D0" stroke-width="6" stroke-linecap="round"/>
+    <path d="M118 47H142M118 65H142M118 83H134" stroke="#38BDF8" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="139" cy="106" r="7" fill="#22C55E"/>
+    <text x="91" y="169" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="700" fill="#334155">remote host</text>
+  </g>
+
+  <path d="M672 132H536" stroke="url(#fileLane)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M425 132H286" stroke="url(#fileLane)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M306 118L286 132L306 146" stroke="#22C55E" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M286 184H425" stroke="url(#execLane)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M536 184H672" stroke="url(#execLane)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M652 170L672 184L652 198" stroke="#7C3AED" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g transform="translate(410 94)">
+    <rect x="0" y="0" width="140" height="116" rx="26" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+    <rect x="20" y="22" width="100" height="72" rx="18" fill="#F8FAFC" stroke="#E2E8F0"/>
+    <path d="M43 48H66L79 35" stroke="#22C55E" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M97 68H74L61 81" stroke="#2563EB" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="43" cy="48" r="7" fill="#22C55E"/>
+    <circle cx="97" cy="68" r="7" fill="#2563EB"/>
+    <text x="70" y="136" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="800" fill="#334155">hook</text>
+  </g>
+
+  <g transform="translate(314 244)">
+    <rect x="0" y="-24" width="132" height="34" rx="17" fill="#DCFCE7"/>
+    <circle cx="20" cy="-7" r="5" fill="#22C55E"/>
+    <text x="36" y="-1" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#166534">sshfs files</text>
+  </g>
+  <g transform="translate(514 244)">
+    <rect x="0" y="-24" width="160" height="34" rx="17" fill="#EDE9FE"/>
+    <circle cx="20" cy="-7" r="5" fill="#7C3AED"/>
+    <text x="36" y="-1" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#5B21B6">ssh exec route</text>
+  </g>
+
+  <text x="480" y="68" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="36" font-weight="900" fill="#0F172A">Rah</text>
+  <text x="480" y="91" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#475569">Remote as Host</text>
+</svg>
