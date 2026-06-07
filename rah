@@ -13,10 +13,31 @@ RAH_BIN_DIR="${RAH_BIN_DIR:-$HOME/.local/bin}"
 RAH_MOUNT_ROOT="${RAH_MOUNT_ROOT:-$HOME/mnt_rah}"
 RAH_HOOK_LOG_DEFAULT="$RAH_CONFIG_DIR/hook.jsonl"
 RAH_HOOK_LOG_FLAG="$RAH_CONFIG_DIR/hook-log"
-# Required runtime dependencies as bin:apt-package (fusermount/curl handled separately).
-RAH_DEPS=(ssh:openssh-client sshfs:sshfs jq:jq base64:coreutils timeout:coreutils mountpoint:util-linux)
+RAH_UNAME="$(uname -s 2>/dev/null || echo unknown)"
 
-_self_path() { readlink -f "${BASH_SOURCE[0]}"; }
+_is_macos() { [ "$RAH_UNAME" = Darwin ]; }
+
+# Required runtime dependencies as bin:package-hint.
+if _is_macos; then
+  RAH_DEPS=(ssh:openssh sshfs:sshfs jq:jq base64:coreutils perl:perl)
+else
+  RAH_DEPS=(ssh:openssh-client sshfs:sshfs jq:jq base64:coreutils timeout:coreutils mountpoint:util-linux)
+fi
+
+_self_path() {
+  local src="${BASH_SOURCE[0]}" dir found
+  if [ "${src%/*}" = "$src" ]; then
+    found="$(command -v -- "$src" 2>/dev/null || true)"
+    [ -n "$found" ] && src="$found"
+  fi
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd -P)" || return 1
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  dir="$(cd -P "$(dirname "$src")" && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$src")"
+}
 
 # ---------- helpers ----------
 
@@ -55,6 +76,190 @@ _tag_fail() { printf '%b' "${RAH_RED}[$*]${RAH_RESET}"; }
 _tag_note() { printf '%b' "${RAH_DIM}[$*]${RAH_RESET}"; }
 
 _die() { printf '%b\n' "${RAH_RED}rah: error:${RAH_RESET} $*" >&2; exit 1; }
+
+_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+_timeout() {
+  local seconds="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'my $seconds = shift @ARGV; alarm $seconds; exec @ARGV or die "exec: $!\n"' "$seconds" "$@"
+  else
+    "$@"
+  fi
+}
+
+_b64_encode() { base64 | tr -d '\n'; }
+
+_file_mtime() {
+  if _is_macos; then
+    stat -f %m "$1"
+  else
+    stat -c %Y "$1"
+  fi
+}
+
+_file_recent() {
+  local path="$1" max_age="$2" now mtime
+  [ -e "$path" ] || return 1
+  now="$(date +%s)"
+  mtime="$(_file_mtime "$path" 2>/dev/null)" || return 1
+  [ "$((now - mtime))" -lt "$max_age" ]
+}
+
+_is_mountpoint() {
+  local mp="$1"
+  if command -v mountpoint >/dev/null 2>&1; then
+    _timeout 3 mountpoint -q "$mp" 2>/dev/null
+  else
+    mount | awk -v mp="$mp" 'index($0, " on " mp " (") > 0 {found=1} END {exit found ? 0 : 1}'
+  fi
+}
+
+_unmount_fuse() {
+  local mp="$1"
+  if command -v fusermount3 >/dev/null 2>&1; then
+    fusermount3 -uz "$mp"
+  elif command -v fusermount >/dev/null 2>&1; then
+    fusermount -uz "$mp"
+  elif _is_macos; then
+    diskutil unmount force "$mp" >/dev/null 2>&1 || umount -f "$mp"
+  else
+    umount -l "$mp"
+  fi
+}
+
+_find_brew() {
+  command -v brew 2>/dev/null && return 0
+  [ -x /opt/homebrew/bin/brew ] && { printf '%s\n' /opt/homebrew/bin/brew; return 0; }
+  [ -x /usr/local/bin/brew ] && { printf '%s\n' /usr/local/bin/brew; return 0; }
+  return 1
+}
+
+_find_port() {
+  command -v port 2>/dev/null && return 0
+  [ -x /opt/local/bin/port ] && { printf '%s\n' /opt/local/bin/port; return 0; }
+  return 1
+}
+
+_find_sshfs() {
+  command -v sshfs 2>/dev/null && return 0
+  [ -x /opt/homebrew/bin/sshfs ] && { printf '%s\n' /opt/homebrew/bin/sshfs; return 0; }
+  [ -x /usr/local/bin/sshfs ] && { printf '%s\n' /usr/local/bin/sshfs; return 0; }
+  [ -x /opt/local/bin/sshfs ] && { printf '%s\n' /opt/local/bin/sshfs; return 0; }
+  return 1
+}
+
+_sshfs_bin() {
+  if _is_macos; then
+    _find_sshfs
+  else
+    command -v sshfs
+  fi
+}
+
+_macos_port_pkg() {
+  case "$1" in
+    sshfs|sshfs-mac) printf 'sshfs' ;;
+    *)               printf '%s' "$1" ;;
+  esac
+}
+
+_macos_brew_pkg() {
+  case "$1" in
+    sshfs|sshfs-mac) printf 'sshfs-mac' ;;
+    *)               printf '%s' "$1" ;;
+  esac
+}
+
+_pkg_install_note() {
+  local pkg="$1"
+  if _is_macos; then
+    local brew port
+    if brew="$(_find_brew 2>/dev/null)"; then
+      case "$pkg" in
+        sshfs|sshfs-mac) printf '%s install --cask sshfs-mac' "$brew" ;;
+        *)               printf '%s install %s' "$brew" "$(_macos_brew_pkg "$pkg")" ;;
+      esac
+    elif port="$(_find_port 2>/dev/null)"; then
+      printf 'sudo %s install %s' "$port" "$(_macos_port_pkg "$pkg")"
+    elif [ "$pkg" = sshfs ] || [ "$pkg" = sshfs-mac ]; then
+      printf 'install macFUSE + SSHFS manually: https://macfuse.github.io/'
+    else
+      printf 'install %s manually or with your package manager' "$pkg"
+    fi
+  else
+    printf 'apt install %s' "$pkg"
+  fi
+}
+
+_dep_install_hints() {
+  local missing="$1" pkg formulae="" casks="" ports="" brew port
+  if _is_macos; then
+    if brew="$(_find_brew 2>/dev/null)"; then
+      for pkg in $missing; do
+        case "$pkg" in
+          sshfs|sshfs-mac) casks="$casks sshfs-mac" ;;
+          *)               formulae="$formulae $(_macos_brew_pkg "$pkg")" ;;
+        esac
+      done
+      [ -z "$formulae" ] || printf '%s install%s\n' "$brew" "$formulae"
+      [ -z "$casks" ] || printf '%s install --cask%s\n' "$brew" "$casks"
+    elif port="$(_find_port 2>/dev/null)"; then
+      for pkg in $missing; do ports="$ports $(_macos_port_pkg "$pkg")"; done
+      [ -z "$ports" ] || printf 'sudo %s install%s\n' "$port" "$ports"
+    else
+      for pkg in $missing; do
+        case "$pkg" in
+          sshfs|sshfs-mac)
+            printf 'Install macFUSE: https://macfuse.github.io/\n'
+            printf 'Install SSHFS for macFUSE: https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS\n' ;;
+          *)
+            printf 'Install %s manually or with your package manager.\n' "$pkg" ;;
+        esac
+      done
+    fi
+  elif command -v apt-get >/dev/null 2>&1; then
+    printf 'sudo apt-get update -qq && sudo apt-get install -y %s\n' "$missing"
+  else
+    printf 'install equivalent packages: %s\n' "$missing"
+  fi
+}
+
+_can_auto_install_deps() {
+  if _is_macos; then
+    _find_brew >/dev/null 2>&1 || _find_port >/dev/null 2>&1
+  else
+    command -v apt-get >/dev/null 2>&1
+  fi
+}
+
+_install_missing_deps() {
+  local missing="$1" pkg formulae="" casks="" ports="" brew port
+  if _is_macos; then
+    if brew="$(_find_brew 2>/dev/null)"; then
+      for pkg in $missing; do
+        case "$pkg" in
+          sshfs|sshfs-mac) casks="$casks sshfs-mac" ;;
+          *)               formulae="$formulae $(_macos_brew_pkg "$pkg")" ;;
+        esac
+      done
+      [ -z "$formulae" ] || "$brew" install $formulae
+      [ -z "$casks" ] || "$brew" install --cask $casks
+    elif port="$(_find_port 2>/dev/null)"; then
+      for pkg in $missing; do ports="$ports $(_macos_port_pkg "$pkg")"; done
+      [ -z "$ports" ] || sudo "$port" install $ports
+    else
+      return 1
+    fi
+  else
+    command -v apt-get >/dev/null 2>&1 || return 1
+    sudo apt-get update -qq && sudo apt-get install -y $missing
+  fi
+}
 
 # POSIX single-quote escaping for safe embedding in a remote shell string.
 _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -191,7 +396,7 @@ _prepare_mountpoint() {
     fi
   fi
   mp="$(cd -P "$mp" && pwd -P)" || return 1
-  if ! timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+  if ! _is_mountpoint "$mp"; then
     first="$(find "$mp" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | head -n 1 || true)"
     if [ -n "$first" ]; then
       echo "rah: local mountpoint is not empty: $mp" >&2
@@ -277,15 +482,15 @@ _translate_command_paths() {
 
 # Fast, timeout-guarded liveness probe. A dead fuse mount hangs on access, so this
 # must never run unguarded. Returns 0 if the path is reachable.
-_mount_alive() { timeout 2 stat "$1" >/dev/null 2>&1; }
+_mount_alive() { _timeout 2 stat "$1" >/dev/null 2>&1; }
 
 # Classify a mountpoint: mounted | dead | unmounted. `mountpoint -q` alone lies
 # (a dead fuse mount still reports as mounted), so combine it with a liveness probe.
 _mount_state() {
   local mp="$1"
-  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+  if _is_mountpoint "$mp"; then
     _mount_alive "$mp" && echo mounted || echo dead
-  elif timeout 3 stat "$mp" >/dev/null 2>&1; then
+  elif _timeout 3 stat "$mp" >/dev/null 2>&1; then
     echo unmounted
   else
     echo dead
@@ -320,6 +525,24 @@ _explain_ssh_failure() {
     printf '%b\n' "  ${RAH_CYAN}ssh -o BatchMode=yes -o ConnectTimeout=5 $host true${RAH_RESET}" >&2
   fi
   echo "  if you normally use an ssh alias, use that alias in the rah target." >&2
+}
+
+_authorize_ssh_key() {
+  local host="$1" port="${2:-}" pub="" ssh_args=()
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  if command -v ssh-copy-id >/dev/null 2>&1; then
+    if [ -n "$port" ]; then
+      ssh-copy-id -p "$port" "$host"
+    else
+      ssh-copy-id "$host"
+    fi
+    return $?
+  fi
+
+  pub="$(ls "$HOME"/.ssh/id_*.pub 2>/dev/null | head -n 1 || true)"
+  [ -n "$pub" ] || return 1
+  _say_warn "ssh-copy-id not found; appending $pub with ssh fallback"
+  cat "$pub" | ssh "${ssh_args[@]}" "$host" 'umask 077; mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys'
 }
 
 # Print the active hook log path. Logging is disabled unless RAH_HOOK_LOG is set
@@ -380,13 +603,20 @@ _hook_log_event() {
       command:$command,command_truncated:$command_truncated}' >> "$path" 2>/dev/null || true
 }
 
-# Space-separated apt packages for any missing required deps (deduped; empty if all present).
+# Space-separated packages for any missing required deps (deduped; empty if all present).
 _missing_pkgs() {
   local d bin out=""
   for d in "${RAH_DEPS[@]}"; do
-    bin="${d%%:*}"; command -v "$bin" >/dev/null 2>&1 || out="$out ${d#*:}"
+    bin="${d%%:*}"
+    if _is_macos && [ "$bin" = sshfs ]; then
+      _find_sshfs >/dev/null 2>&1 || out="$out ${d#*:}"
+    else
+      command -v "$bin" >/dev/null 2>&1 || out="$out ${d#*:}"
+    fi
   done
-  command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1 || out="$out fuse3"
+  if ! _is_macos; then
+    command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1 || out="$out fuse3"
+  fi
   printf '%s\n' $out | sort -u | xargs
 }
 
@@ -463,19 +693,21 @@ _remote_uname() {
 # Mount remote_path at mp. Re-establishes master, clears a stale mount,
 # and skips work if already healthy. Returns sshfs's status.
 _do_mount() {
-  local host="$1" remote_path="$2" mp="$3" socket="$4" port="${5:-}" sshfs_args=() opts remote_os
+  local host="$1" remote_path="$2" mp="$3" socket="$4" port="${5:-}" sshfs_args=() opts remote_os sshfs_bin
   [ -n "$port" ] && sshfs_args=(-p "$port")
+  sshfs_bin="$(_sshfs_bin)" || return 1
   _ensure_master "$host" "$socket" "$port" || return 1
-  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
+  if _is_mountpoint "$mp"; then
     _mount_alive "$mp" && return 0               # already mounted & healthy
-    fusermount -uz "$mp" 2>/dev/null || true     # stale -> clear before remount
+    _unmount_fuse "$mp" 2>/dev/null || true      # stale -> clear before remount
   fi
   opts="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath=$socket"
+  _is_macos && opts="$opts,defer_permissions"
   remote_os="$(_remote_uname "$host" "$socket" "$port")"
   case "$remote_os" in
     Darwin) opts="$opts,sftp_server=/usr/libexec/sftp-server" ;;
   esac
-  sshfs "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
+  "$sshfs_bin" "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
     -o "$opts"
 }
 
@@ -544,7 +776,7 @@ cmd_mount() {
   local socket="$(_socket_for_host "$host" "$port")"
 
   local owner_cfg owner_host owner_remote owner_port
-  if timeout 3 mountpoint -q "$mountpoint" 2>/dev/null; then
+  if _is_mountpoint "$mountpoint"; then
     if owner_cfg="$(_config_for_mountpoint_exact "$mountpoint")"; then
       owner_host="$(_get "$owner_cfg" host)"
       owner_remote="$(_get "$owner_cfg" remote_path)"
@@ -599,7 +831,7 @@ cmd_remount() {
     [ -f "$cfg" ] || { echo "rah: no such mount: $name" >&2; continue; }
     host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
     mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
-    fusermount -uz "$mp" 2>/dev/null || true
+    _unmount_fuse "$mp" 2>/dev/null || true
     if _do_mount "$host" "$remote_path" "$mp" "$socket" "$port"; then
       _say_ok "remounted $name"
       _say_note "local: $mp"
@@ -619,8 +851,8 @@ cmd_unmount() {
   local mp host socket port ssh_args=()
   mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
   [ -n "$port" ] && ssh_args=(-p "$port")
-  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
-    fusermount -uz "$mp" || _die "fusermount failed for $mp"
+  if _is_mountpoint "$mp"; then
+    _unmount_fuse "$mp" || _die "unmount failed for $mp"
   fi
   ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
   _say_ok "unmounted $name"
@@ -645,8 +877,8 @@ cmd_remove() {
   name="$(basename "$cfg" .env)"
   mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
   [ -n "$port" ] && ssh_args=(-p "$port")
-  if timeout 3 mountpoint -q "$mp" 2>/dev/null; then
-    fusermount -uz "$mp" || _die "fusermount failed for $mp"
+  if _is_mountpoint "$mp"; then
+    _unmount_fuse "$mp" || _die "unmount failed for $mp"
     _say_ok "unmounted $name"
   fi
   ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
@@ -698,7 +930,7 @@ cmd_run() {
   _ensure_master "$host" "$socket" "$port" 2>/dev/null || true   # self-heal a dead master
 
   local b64 pre=""
-  b64="$(printf '%s' "$cmd" | base64 -w0)"
+  b64="$(printf '%s' "$cmd" | _b64_encode)"
   [ -n "$prelude" ] && pre="{ $prelude; } && "
 
   local remote="cd $(_shq "$remote_cwd") && ${pre}printf %s $(_shq "$b64") | base64 -d | bash"
@@ -752,7 +984,7 @@ cmd_hook() {
   if [ -n "$cfg" ]; then
     local _name _stamp
     _name="$(basename "$cfg" .env)"; _stamp="$RAH_CONFIG_DIR/.heal.$_name"
-    if [ -z "$(find "$_stamp" -newermt '-10 seconds' 2>/dev/null)" ]; then
+    if ! _file_recent "$_stamp" 10; then
       : > "$_stamp" 2>/dev/null || true
       if ! _mount_alive "$(_get "$cfg" mountpoint)"; then
         if command -v setsid >/dev/null 2>&1; then
@@ -793,7 +1025,7 @@ cmd_hook() {
   local newcmd
   case "$cmd" in
     *[!A-Za-z0-9\ _.,=/+:@%-]*)
-      newcmd="rah run --cwd $(_shq "$cwd") --b64 $(printf '%s' "$cmd" | base64 -w0)" ;;
+      newcmd="rah run --cwd $(_shq "$cwd") --b64 $(printf '%s' "$cmd" | _b64_encode)" ;;
     *)
       newcmd="rah run --cwd $(_shq "$cwd") -- $cmd" ;;
   esac
@@ -963,12 +1195,12 @@ cmd_setup() {
 	  local missing; missing="$(_missing_pkgs)"
 	  if [ -n "$missing" ]; then
 	    _say_warn "missing packages: $missing"
-	    _say_cmd "sudo apt-get update -qq && sudo apt-get install -y $missing"
-	    if command -v apt-get >/dev/null 2>&1 && _confirm "install them now with sudo apt-get?"; then
-	      sudo apt-get update -qq && sudo apt-get install -y $missing || _die "apt install failed"
+	    while IFS= read -r line; do [ -n "$line" ] && _say_cmd "$line"; done < <(_dep_install_hints "$missing")
+	    if _can_auto_install_deps && _confirm "install them now?"; then
+	      _install_missing_deps "$missing" || _die "dependency install failed"
 	      missing="$(_missing_pkgs)"; [ -z "$missing" ] || _die "still missing: $missing"
 	    else
-	      command -v apt-get >/dev/null 2>&1 || _say_warn "automatic dependency install currently supports apt-get systems only"
+	      _can_auto_install_deps || _say_warn "automatic dependency install needs apt-get on Linux, or Homebrew/MacPorts on macOS"
 	      _die "install these packages first: $missing"
 	    fi
 	  fi
@@ -1001,9 +1233,9 @@ cmd_setup() {
 	        if _confirm "no ssh key found — generate one (ssh-keygen ed25519)?"; then
 	          ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519"
         fi
-      fi
+	      fi
 	      if _confirm "authorize your key on $host now? (you'll enter the remote password once)"; then
-	        ssh-copy-id "$host" || true
+	        _authorize_ssh_key "$host" "$port" || true
 	      fi
 	      _ssh_ok "$host" "$port" || { _say_fail "still cannot use non-interactive ssh to $host"; _say_cmd "rah setup $target"; return 1; }
 	    else
@@ -1095,9 +1327,11 @@ cmd_setup() {
 
 _agent_hook_status() {
   local label="$1" cfg="$2" expected_cmd="$3" expected_matcher="$4"
+  local agent
+  agent="$(_lower "$label")"
   printf '  %-10s ' "$label"
   if [ ! -f "$cfg" ]; then
-    printf '%b\n' "$(_tag_warn "not installed") run: rah init ${label,,}"
+    printf '%b\n' "$(_tag_warn "not installed") run: rah init $agent"
     return 1
   fi
   if jq -e --arg cmd "$expected_cmd" --arg matcher "$expected_matcher" '
@@ -1108,9 +1342,9 @@ _agent_hook_status() {
     return 0
   fi
   if _hook_present "$cfg"; then
-    printf '%b\n' "$(_tag_warn "needs update") run: rah init ${label,,}"
+    printf '%b\n' "$(_tag_warn "needs update") run: rah init $agent"
   else
-    printf '%b\n' "$(_tag_fail "missing") run: rah init ${label,,}"
+    printf '%b\n' "$(_tag_fail "missing") run: rah init $agent"
   fi
   return 1
 }
@@ -1144,7 +1378,7 @@ _cfg_from_arg_or_cwd() {
 
 _exec_plane_ok() {
   local mp="$1"
-  timeout 15 "$(_self_path)" run --cwd "$mp" -- true >/dev/null 2>&1
+  _timeout 15 "$(_self_path)" run --cwd "$mp" -- true >/dev/null 2>&1
 }
 
 cmd_status() {
@@ -1214,7 +1448,7 @@ cmd_verify() {
   fi
 
   printf '  exec:       '
-  if out="$(timeout 15 "$(_self_path)" run --cwd "$mp" -- pwd 2>/dev/null)" && [ "$out" = "$remote_path" ]; then
+  if out="$(_timeout 15 "$(_self_path)" run --cwd "$mp" -- pwd 2>/dev/null)" && [ "$out" = "$remote_path" ]; then
     _tag_ok "remote ok"; printf '\n'
   else
     _tag_fail "FAILED"; printf ' explicit rah run did not cd to %s\n' "$remote_path"
@@ -1223,8 +1457,8 @@ cmd_verify() {
 
   printf '  path map:   '
   path_cmd="printf %s $(_shq "$mp")"
-  path_b64="$(printf '%s' "$path_cmd" | base64 -w0)"
-  if out="$(timeout 15 "$(_self_path)" run --cwd "$mp" --b64 "$path_b64" 2>/dev/null)" && [ "$out" = "$remote_path" ]; then
+  path_b64="$(printf '%s' "$path_cmd" | _b64_encode)"
+  if out="$(_timeout 15 "$(_self_path)" run --cwd "$mp" --b64 "$path_b64" 2>/dev/null)" && [ "$out" = "$remote_path" ]; then
     _tag_ok "ok"; printf '\n'
   else
     _tag_fail "FAILED"; printf ' local absolute path was not translated\n'
@@ -1278,10 +1512,17 @@ _check_dep() {  # name pkg required(0|1) ; prints status, returns non-zero if mi
   local bin="$1" pkg="$2" required="$3"
   printf '  %-12s ' "$bin"
   if command -v "$bin" >/dev/null 2>&1; then _tag_ok "ok"; printf '\n'; return 0; fi
+  if _is_macos && [ "$bin" = sshfs ]; then
+    local sshfs_path
+    if sshfs_path="$(_find_sshfs 2>/dev/null)"; then
+      _tag_ok "ok"; printf ' %s\n' "$sshfs_path"
+      return 0
+    fi
+  fi
   if [ "$required" -eq 1 ]; then
-    _tag_fail "MISSING"; printf ' apt install %s\n' "$pkg"
+    _tag_fail "MISSING"; printf ' %s\n' "$(_pkg_install_note "$pkg")"
   else
-    _tag_warn "optional"; printf ' apt install %s\n' "$pkg"
+    _tag_warn "optional"; printf ' %s\n' "$(_pkg_install_note "$pkg")"
   fi
   return 1
 }
@@ -1290,10 +1531,12 @@ cmd_doctor() {
   local ok=1 d
   _say_header "rah doctor (v$RAH_VERSION)"
   for d in "${RAH_DEPS[@]}"; do _check_dep "${d%%:*}" "${d#*:}" 1 || ok=0; done
-  if command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1; then
-    printf '  %-12s ' fusermount; _tag_ok "ok"; printf '\n'
-  else
-    printf '  %-12s ' fusermount; _tag_fail "MISSING"; printf ' apt install fuse3\n'; ok=0
+  if ! _is_macos; then
+    if command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1; then
+      printf '  %-12s ' fusermount; _tag_ok "ok"; printf '\n'
+    else
+      printf '  %-12s ' fusermount; _tag_fail "MISSING"; printf ' %s\n' "$(_pkg_install_note fuse3)"; ok=0
+    fi
   fi
   _check_dep curl       curl           0 || true
   printf '  %-12s ' PATH

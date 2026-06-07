@@ -41,8 +41,8 @@ Rah 做两件事：
 
 **Rah 安装在 agent host 上，不安装在 remote host 上。**
 
-当前稳定支持的 agent host 是具备 sshfs/FUSE、`ssh` 和标准 shell 工具的 Linux 环境，主要是 Ubuntu、Debian、WSL2 或 Linux gateway。
-原生 macOS / 原生 Windows 作为 agent host 还不是稳定目标；Windows 用户优先使用 WSL2，macOS 用户可以使用一台 Linux gateway。
+当前支持的 agent host 是具备 sshfs/FUSE、`ssh` 和标准 shell 工具的 Unix-like 环境，主要是 Ubuntu、Debian、WSL2 和 macOS。
+原生 Windows 作为 agent host 不在当前范围内；Windows 用户优先使用 WSL2。
 
 remote host 不需要安装 `rah`。它只需要能 SSH 登录，并提供可访问的项目目录；Linux server、workstation，或开启 SSH 的 macOS 机器都可以作为 remote target。
 
@@ -61,7 +61,7 @@ remote host。这样账号登录态只留在一个地方，项目和命令执行
 
 ### 先确认环境
 
-- 在运行 Claude Code / Codex 的这台机器上安装 `rah`。当前推荐 Ubuntu、Debian、WSL2 或 Linux gateway。
+- 在运行 Claude Code / Codex 的这台机器上安装 `rah`。当前推荐 Ubuntu、Debian、WSL2、macOS 或 Linux gateway。
 - 远端机器只需要开启 SSH，并且有你的项目目录；远端不需要安装 `rah`。
 - 如果远端 SSH 不是默认 22 端口，后面 setup 时填 `--port` 即可。
 
@@ -83,13 +83,15 @@ rah version
 
 如果提示找不到 `rah`，重新打开终端，或者把 `~/.local/bin` 加到 `PATH`。
 
+macOS 上如果缺少 SSHFS，安装器会按你的机器给出 Homebrew、MacPorts 或手动安装 macFUSE + SSHFS 的路径。macFUSE 第一次挂载前可能需要在系统设置里批准。需要强制选择路径时，可以设置 `RAH_MACOS_SSHFS_INSTALLER=brew`、`macports` 或 `manual`。
+
 **方式二：让 Claude Code / Codex 帮你安装**
 
 在 agent 会话里直接说：
 
 > **“Install Rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`.”**
 
-agent 可以帮你下载和运行命令。如果遇到 `sudo`、SSH 密码或 `ssh-copy-id`，请按它给出的命令回到真实终端执行一次。
+agent 可以帮你下载和运行命令。如果遇到 `sudo`、SSH 密码、`ssh-copy-id` 或 macFUSE/SSHFS 安装提示，请按它给出的命令回到真实终端执行一次。
 
 ### 第一次连接远端项目
 
@@ -114,7 +116,7 @@ rah setup --port 2222 you@devbox.example.com:~/project
 rah setup you@host:~/project ~/projects/project
 ```
 
-> `rah setup` 可能需要安装本地依赖、授权 SSH key 或创建本地目录，这些步骤可能要求输入密码。请在真实终端运行它，不要在 agent 的无 TTY shell 里运行。
+> `rah setup` 可能需要安装本地依赖（`apt`、Homebrew、MacPorts 或手动 macFUSE/SSHFS）、授权 SSH key 或创建本地目录，这些步骤可能要求输入密码。请在真实终端运行它，不要在 agent 的无 TTY shell 里运行。
 
 ### 开始开发
 
@@ -203,9 +205,10 @@ Codex 在安装或更新后可能要求你 review hooks。对 rah hook 选择 **
 
 ## 要求
 
-- **支持的 agent host**：具备 sshfs/FUSE 支持的 Linux；主要目标是 Ubuntu、Debian、WSL2 或 Linux gateway。原生 macOS / 原生 Windows 作为 agent host 暂未稳定支持。
-- **本地依赖包**：`bash`、`ssh`、`sshfs`（加 `fuse`/`fuse3`）、`jq`、`coreutils`（`base64`）、`util-linux`（`mountpoint`）；安装和自更新需要 `curl`。运行 `rah doctor` 检查。
-- **SSH**：必须能 passwordless key-based ssh 到远端，`ssh <host> true` 不能要求输入密码。`rah setup` 会预检，并在缺失时提示 `ssh-copy-id`。
+- **支持的 agent host**：具备 sshfs/FUSE 支持的 Linux 或 macOS；主要目标是 Ubuntu、Debian、WSL2 和 macOS。当前不支持原生 Windows。
+- **Linux 本地依赖包**：`bash`、`ssh`、`sshfs`（加 `fuse`/`fuse3`）、`jq`、`coreutils`（`base64`、`timeout`）、`util-linux`（`mountpoint`）；安装和自更新需要 `curl`。
+- **macOS 本地依赖包**：`bash`、`ssh`、通过 macFUSE 提供的 `sshfs`、`jq`、`base64` 和 `perl`；安装和自更新需要 `curl`。SSHFS/macFUSE 可以通过 Homebrew（`brew install --cask sshfs-mac`）、MacPorts（`sudo port install sshfs`）或官方 macFUSE + SSHFS 安装包安装。即使 SSHFS 不在 PATH，`rah` 也会尝试在常见 Homebrew/MacPorts 路径中查找。运行 `rah doctor` 检查。
+- **SSH**：必须能 passwordless key-based ssh 到远端，`ssh <host> true` 不能要求输入密码。`rah setup` 会预检，并可通过 `ssh-copy-id` 或 ssh fallback 授权你的 key。
 - **远端**：只需要标准 OpenSSH server、POSIX shell 和 `base64`。Linux server/workstation 或开启 SSH 的 macOS 都可以作为 remote target。
 
 ## 安全

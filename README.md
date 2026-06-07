@@ -46,9 +46,9 @@ remote only needs SSH and basic shell tools.
 
 **Install Rah on the agent host, not on the remote host.**
 
-The stable agent host target today is Linux with sshfs/FUSE, `ssh`, and standard shell tools:
-Ubuntu, Debian, WSL2, or a Linux gateway. Native macOS / native Windows as the agent host are not
-stable targets yet; Windows users should prefer WSL2, and macOS users can use a Linux gateway.
+The supported agent host target today is a Unix-like environment with sshfs/FUSE, `ssh`, and
+standard shell tools: Ubuntu, Debian, WSL2, and macOS. Native Windows as the agent host is outside
+the current scope; Windows users should prefer WSL2.
 
 The remote host does not need `rah`. It only needs SSH access and a project directory. A Linux
 server/workstation, or an SSH-enabled macOS machine, can be a remote target.
@@ -70,8 +70,8 @@ project files and command execution still happen on the right remote machine.
 
 ### Check Your Environment
 
-- Install `rah` on the machine that runs Claude Code / Codex. Ubuntu, Debian, WSL2, or a Linux
-  gateway are the recommended environments today.
+- Install `rah` on the machine that runs Claude Code / Codex. Ubuntu, Debian, WSL2, macOS, or a
+  Linux gateway are the recommended environments today.
 - The remote machine only needs SSH enabled and a project directory. It does not need `rah`.
 - If your remote SSH uses a non-default port, pass `--port` during setup.
 
@@ -93,14 +93,19 @@ rah version
 
 If your shell cannot find `rah`, reopen the terminal or add `~/.local/bin` to `PATH`.
 
+On macOS, if SSHFS is missing, the installer points you to the right path for your machine:
+Homebrew, MacPorts, or manual macFUSE + SSHFS installers. macFUSE may require approval in System
+Settings before the first mount works. To force a path, set `RAH_MACOS_SSHFS_INSTALLER=brew`,
+`macports`, or `manual`.
+
 **Option 2: ask Claude Code / Codex to install it**
 
 In an agent session, say:
 
 > **"Install Rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`."**
 
-The agent can download rah and prepare the commands. If it needs `sudo`, an SSH password, or
-`ssh-copy-id`, run the command it prints in a real terminal once.
+The agent can download rah and prepare the commands. If it needs `sudo`, an SSH password,
+`ssh-copy-id`, or macFUSE/SSHFS install steps, run the command it prints in a real terminal once.
 
 ### Connect Your First Remote Project
 
@@ -125,9 +130,9 @@ rah setup --port 2222 you@devbox.example.com:~/project
 rah setup you@host:~/project ~/projects/project
 ```
 
-> `rah setup` may install local dependencies, authorize your SSH key, or create a local directory.
-> Those steps can ask for a password, so run setup in a real terminal, not inside an agent shell
-> without a TTY.
+> `rah setup` may install local dependencies (`apt`, Homebrew, MacPorts, or manual macFUSE/SSHFS
+> steps), authorize your SSH key, or create a local directory. Those steps can ask for a password,
+> so run setup in a real terminal, not inside an agent shell without a TTY.
 
 ### Start Developing
 
@@ -233,12 +238,18 @@ target path for rah today; use the interactive CLI/TUI for transparent remote ex
 
 ## Requirements
 
-- **Supported agent host:** Linux with sshfs/FUSE support; primary target is Ubuntu, Debian, WSL2,
-  or a Linux gateway. Native macOS / native Windows as the agent host are not stable targets yet.
-- **Local packages:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils` (`base64`),
-  `util-linux` (`mountpoint`); `curl` for install/self-update. Run `rah doctor` to check.
+- **Supported agent host:** Linux or macOS with sshfs/FUSE support; primary targets are Ubuntu,
+  Debian, WSL2, and macOS. Native Windows is not supported.
+- **Linux local packages:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils`
+  (`base64`, `timeout`), `util-linux` (`mountpoint`); `curl` for install/self-update.
+- **macOS local packages:** `bash`, `ssh`, `sshfs` through macFUSE, `jq`, `base64`, and `perl`;
+  `curl` for install/self-update. For SSHFS/macFUSE, use Homebrew
+  (`brew install --cask sshfs-mac`), MacPorts (`sudo port install sshfs`), or the official
+  macFUSE + SSHFS installer packages. `rah` can find SSHFS in the usual Homebrew/MacPorts
+  locations even if it is not on PATH. Run `rah doctor` to check.
 - **SSH:** passwordless key-based ssh to the remote — `ssh <host> true` must succeed without a
-  prompt. `rah setup` preflights this and points you to `ssh-copy-id` if it's missing.
+  prompt. `rah setup` preflights this and can authorize your key with `ssh-copy-id` or an
+  ssh-based fallback.
 - **Remote:** a standard OpenSSH server, POSIX shell, and `base64`. A Linux server/workstation or an
   SSH-enabled macOS machine can be a remote target.
 
