@@ -12,110 +12,126 @@
 
 [English](README.md)
 
-让你的本地机器像远端开发机一样服务 coding agent（Claude Code、Codex）。
-agent 仍然运行在本地；真正的项目、代码、重数据集和 GPU 都留在远端。
-`rah` 给 agent 提供两个被强制执行的平面：
+Rah 让 Claude Code / Codex 像在远端机器上一样开发项目，但账号只登录在你指定的一台电脑上。
 
-- **文件面**：通过 **sshfs mount** 编辑远端代码树。默认挂到本机 `~/mnt_rah/<project>`，也可以指定任意空的本地目录。数据集不会被挂载，仍留在远端，避免一次误搜索把大量数据拖到本地。
-- **执行面**：通过 `PreToolUse` **hook** 把 agent 的 shell 命令透明改写到远端 ssh 执行。这个路由是确定性的，不靠提示词提醒模型。agent 的行为就像它真的在远端机器上一样。
+典型场景：
 
-路由是 hook 强制的不变量，不是 prompt 里的请求，所以模型不会“忘记”在远端运行。
-**远端零安装**：只在本机安装 `rah`；远端只需要标准的 `sshd`、`bash` 和 `base64`。
+- A 电脑运行 Claude Code / Codex，并安装 `rah`。
+- B 电脑或服务器保存真实项目、大数据集、模型权重和 GPU 环境。
+- 你在 A 上正常使用 agent；文件来自 B，命令也在 B 上执行。
 
-## 项目边界
+适合你如果：
 
-`rah` 有意聚焦在 Linux-based agent gateway 这一种模型上：
+- 不想把 Claude Code / Codex 登录态散落到多台电脑、不同网络或不同 VPN 出口。
+- 想用本地 agent 操作远端工作站、服务器或实验机器。
+- 不想复制大数据集、不想靠 git 同步开发状态。
 
-- **agent host** 是一台 Linux 环境，能够运行 Claude Code / Codex、`sshfs`/FUSE、`ssh` 和标准 shell 工具。Ubuntu、Debian 和 WSL2 是主要目标。
-- **remote host** 只需要 OpenSSH server 和 POSIX shell；远端不需要安装 `rah`。
-- 不同 Linux 发行版的差异主要在安装依赖：Ubuntu/Debian/WSL2 可以走 `apt-get` 引导安装，其它 Linux 发行版需要用自己的包管理器安装等价依赖。
+Rah 做两件事：
 
-原生 macOS 和原生 Windows 不在当前项目范围内。如果个人设备是 macOS 或 Windows，请使用 Linux gateway 机器或 WSL2。
+- 把远端项目目录挂载成本地目录，例如 `~/mnt_rah/<project>`，你可以像编辑本地文件一样编辑远端代码。
+- 自动把 agent 的 shell 命令转发到远端执行，例如测试、训练、调用 GPU、读取大数据集。
+
+这些转发由 hook 自动完成，不靠提示词提醒 agent，所以 agent 不需要知道自己在“远程开发”。
+**远端零安装**：只在 agent 所在机器安装 `rah`；远端只需要标准 SSH 和基本 shell 工具。
+
+## 机器角色
+
+- **agent host**：运行 Claude Code / Codex 和 `rah` 的机器。
+- **remote host**：存放项目、数据、环境和 GPU，并真正执行命令的机器。
+
+**Rah 安装在 agent host 上，不安装在 remote host 上。**
+
+当前稳定支持的 agent host 是具备 sshfs/FUSE、`ssh` 和标准 shell 工具的 Linux 环境，主要是 Ubuntu、Debian、WSL2 或 Linux gateway。
+原生 macOS / 原生 Windows 作为 agent host 还不是稳定目标；Windows 用户优先使用 WSL2，macOS 用户可以使用一台 Linux gateway。
+
+remote host 不需要安装 `rah`。它只需要能 SSH 登录，并提供可访问的项目目录；Linux server、workstation，或开启 SSH 的 macOS 机器都可以作为 remote target。
 
 ## 可信 Agent 网关
 
-`rah` 也支持一种更安全的 coding agent 账号模型：只在一台可信机器上登录 Claude Code / Codex，
-个人电脑通过你自己的远程访问方式连到这台机器；再由这台机器通过 `rah` 去操控任意 server 或 workstation。
-
-这样可以避免把 agent 登录态、浏览器会话、API token 和账号风险散落到多台个人设备上，尤其是多台设备使用不同 VPN 出口或网络位置时。
-agent 账号只留在一个地方；真正的项目执行仍然发生在正确的远端机器上。
-
-如果你购买了 Claude Code 或 Codex 的个人 plan，又希望在多台电脑上使用同一个账号，那么频繁在不同设备、
-不同网络或不同 VPN 出口登录，可能会增加账号风控甚至封禁风险。更稳妥的方式是固定一台可信电脑作为
-**agent host**：只在这台 A 电脑上登录 Claude Code / Codex；另一台 B 电脑或服务器存放真正的项目、
-大型数据集、模型权重和输出文件。通过 `rah`，A 电脑上的 agent 像操作本地目录一样编辑 B 电脑上的项目；
-命令则在 B 电脑上真实执行，例如调用显卡、读取本地大数据集或使用已经配置好的远端环境。
+如果你购买了 Claude Code 或 Codex 的个人 plan，又想在多台电脑上使用，频繁从不同设备、
+网络或 VPN 出口登录同一账号可能增加风控风险。Rah 推荐把 agent 账号固定在一台可信的
+agent host 上；其它电脑通过你自己的远程访问方式连接到这台 agent host，再由 Rah 操控真正的
+remote host。这样账号登录态只留在一个地方，项目和命令执行仍然发生在正确的远端机器上。
 
 <p align="center">
   <img src="assets/rah-seamless-dev.png" alt="Rah 让本地 coding agent 保持正常体验，同时由 hook 将命令路由到远端执行" width="900">
 </p>
 
-## 安装
+## 安装和使用
+
+### 先确认环境
+
+- 在运行 Claude Code / Codex 的这台机器上安装 `rah`。当前推荐 Ubuntu、Debian、WSL2 或 Linux gateway。
+- 远端机器只需要开启 SSH，并且有你的项目目录；远端不需要安装 `rah`。
+- 如果远端 SSH 不是默认 22 端口，后面 setup 时填 `--port` 即可。
+
+### 选择一种安装方式
+
+下面两种方式二选一，不需要都执行。
+
+**方式一：终端一行安装（推荐）**
 
 ```bash
-# 一行安装，重复运行可升级
 curl -fsSL https://raw.githubusercontent.com/Hiaa1/rah/main/install.sh | bash
 ```
 
-想先读代码再运行，也可以 clone 后安装这个单文件脚本：
+安装后检查一下：
 
 ```bash
-git clone https://github.com/Hiaa1/rah && cd rah && ./install.sh
+rah version
 ```
 
-`rah` 是一个自包含 Bash 脚本，方便审计，也可以直接 `scp` 到其它机器。
+如果提示找不到 `rah`，重新打开终端，或者把 `~/.local/bin` 加到 `PATH`。
 
-### 平台说明
+**方式二：让 Claude Code / Codex 帮你安装**
 
-支持的运行环境是具备 sshfs/FUSE 和必要命令行工具的 Linux。在 Ubuntu、Debian 和 WSL2 上，
-`rah setup` 可以询问后通过 `sudo apt-get` 自动安装缺失的本地包。其它 Linux 发行版请先用自己的包管理器安装等价依赖，再运行 setup。
+在 agent 会话里直接说：
 
-### 或者直接让 agent 安装
+> **“Install Rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`.”**
 
-在任意 Claude Code / Codex 会话里，一句话就够：
+agent 可以帮你下载和运行命令。如果遇到 `sudo`、SSH 密码或 `ssh-copy-id`，请按它给出的命令回到真实终端执行一次。
 
-> **“Install rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`.”**
+### 第一次连接远端项目
 
-agent 会按这个 README 操作：检查 passwordless ssh，如果缺失会引导你运行 `ssh-copy-id`
-（只需要那一次输入远端密码），安装 rah，并运行 `rah setup`。你只需要提供远端地址、完成一次 ssh 授权，并在第一次安装 hook 后重启 agent。
-
-## 快速开始
-
-一条命令进入引导式 setup。它会询问 ssh target、可选端口、远端项目路径、本地挂载目录，然后检查依赖、配置已安装的 agent、挂载，并打印实际执行的完整命令：
+在真实终端里运行：
 
 ```bash
 rah setup
 ```
 
-脚本化或重复部署时，也可以显式传完整参数：
+它会依次询问：
+
+- SSH 地址，例如 `you@devbox.example.com`
+- SSH 端口，可以直接回车使用默认端口
+- 远端项目目录，例如 `~/project`
+- 本地挂载目录，可以直接回车使用默认 `~/mnt_rah/<project>`
+
+如果你已经知道完整参数，也可以一行完成：
 
 ```bash
 rah setup you@host:~/project
 rah setup --port 2222 you@devbox.example.com:~/project
-```
-
-> **请在真实终端里运行 `rah setup`，不要在 coding agent 里运行。** 它会通过 `[Y/n]` 提示处理缺失前置条件：安装依赖（`sudo apt`）、生成并授权 ssh key（`ssh-copy-id`），或者在你指定的本地挂载目录需要 root 时创建目录（`sudo`）。这些步骤需要 TTY 来读取密码，而 coding agent 的 shell，包括 Claude Code 的 `!`，没有 TTY，所以会失败。加 `-y` 可以默认确认。无 TTY 运行时，`rah setup` 会检测到并打印需要人手执行的下一步，而不是卡住。
-
-默认本地挂载目录是 `~/mnt_rah/<project>`。如果想挂到自己指定的位置，直接把本地目录作为第二个参数：
-
-```bash
 rah setup you@host:~/project ~/projects/project
 ```
 
-如果确实需要本地和远端绝对路径完全一致，可以显式使用 `--same-path`。
+> `rah setup` 可能需要安装本地依赖、授权 SSH key 或创建本地目录，这些步骤可能要求输入密码。请在真实终端运行它，不要在 agent 的无 TTY shell 里运行。
 
-第一次部署在终端完成；之后日常使用都在 agent 里完成，agent 不需要 TTY 或 `sudo`。
+### 开始开发
 
-然后从 mountpoint 内启动 agent。它的文件工具访问挂载目录；它的命令在远端执行。hook 只需要安装一次（第一次需要重启 agent）；之后新挂载项目会立即生效，不需要重启。完全移除可运行：`rah uninstall`。
-
-把项目交给 agent 前，先做一次验收：
+setup 完成后，进入本地挂载目录：
 
 ```bash
 cd ~/mnt_rah/project
 rah verify
 ```
 
-偏好显式步骤的话：`rah doctor` -> `rah init claude`（或 `codex`）-> `rah mount user@host:~/project ~/projects/project`。
+验证通过后，从这个目录启动 Claude Code / Codex。之后你照常让 agent 读写文件、运行测试或启动训练：
+
+- agent 看到的是本地目录
+- 文件实际来自远端项目
+- shell 命令实际在远端执行
+
+第一次安装 hook 后需要重启一次 agent。之后新增项目只需要再次运行 `rah setup` 或 `rah mount`，不需要重新配置 agent。完全移除可运行 `rah uninstall`。
 
 ## 命令
 
@@ -187,14 +203,14 @@ Codex 在安装或更新后可能要求你 review hooks。对 rah hook 选择 **
 
 ## 要求
 
-- **支持的本地系统**：具备 sshfs/FUSE 支持的 Linux；主要目标是 Ubuntu、Debian 和 WSL2。当前不支持原生 macOS 和原生 Windows。
+- **支持的 agent host**：具备 sshfs/FUSE 支持的 Linux；主要目标是 Ubuntu、Debian、WSL2 或 Linux gateway。原生 macOS / 原生 Windows 作为 agent host 暂未稳定支持。
 - **本地依赖包**：`bash`、`ssh`、`sshfs`（加 `fuse`/`fuse3`）、`jq`、`coreutils`（`base64`）、`util-linux`（`mountpoint`）；安装和自更新需要 `curl`。运行 `rah doctor` 检查。
 - **SSH**：必须能 passwordless key-based ssh 到远端，`ssh <host> true` 不能要求输入密码。`rah setup` 会预检，并在缺失时提示 `ssh-copy-id`。
-- **远端**：只需要标准 OpenSSH server 和 POSIX shell。
+- **远端**：只需要标准 OpenSSH server、POSIX shell 和 `base64`。Linux server/workstation 或开启 SSH 的 macOS 都可以作为 remote target。
 
 ## 安全
 
-`rah` 会把 agent 的命令执行路由到远端主机。Claude 和 Codex 当前都需要 `permissionDecision: "allow"` 才会应用 `updatedInput.command` 改写，所以 `rah init claude` 和 `rah init codex` 会安装 allow-mode hook。位于 rah 管理 mount 内的命令会在 cwd 门控后由 hook 批准；mount 外的命令保持原样放行（Claude 收到 `defer`，Codex 收到空 hook 响应）。整个工具是一个可读 Bash 文件；安装前建议审阅。
+`rah` 会把 agent 的命令执行路由到远端主机。Claude 和 Codex 当前都需要 `permissionDecision: "allow"` 才会应用 `updatedInput.command` 改写，所以 `rah init claude` 和 `rah init codex` 会安装 allow-mode hook。位于 rah 管理 mount 内的命令会在 cwd 门控后由 hook 批准；mount 外的命令保持原样放行（Claude 收到 `defer`，Codex 收到空 hook 响应）。需要排查时，可以用 `rah hook-log` 查看每次 hook 的路由决策。
 
 ## License
 

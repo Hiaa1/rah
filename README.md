@@ -12,138 +12,141 @@
 
 [简体中文](README.zh-CN.md)
 
-Make your local machine act as a remote dev box for coding agents (Claude Code, Codex).
-The agent runs locally; your real project — code, heavy datasets, GPU — stays on a remote.
-`rah` gives the agent two enforced planes:
+Rah lets Claude Code / Codex develop as if it were on a remote machine, while the agent account
+stays logged in on one machine you choose.
 
-- **Files** are edited through an **sshfs mount** of the remote code tree. By default, rah
-  mounts projects under `~/mnt_rah/<project>`; you can also choose any empty local directory.
-  Datasets are *not* mounted (they stay remote), so a stray search can't drag gigabytes over
-  the network.
-- **Execution** is transparently routed to the remote over ssh by a `PreToolUse` **hook**
-  that rewrites the agent's shell commands — deterministically, with no instructions to the
-  model. The agent behaves as if it were on the remote machine.
+Typical setup:
 
-Routing is an *invariant enforced by a hook*, not a request in a prompt — the model cannot
-forget to run on the remote. **Zero remote footprint:** only your machine installs `rah`; the
-remote needs nothing but a stock `sshd`, `bash`, and `base64`.
+- Machine A runs Claude Code / Codex and installs `rah`.
+- Machine B or a server holds the real project, large datasets, model weights, and GPU environment.
+- You use the agent normally on A; files come from B, and commands execute on B.
 
-## Project scope
+Use Rah if you want to:
 
-`rah` is intentionally scoped to a Linux-based agent gateway model:
+- avoid spreading Claude Code / Codex sessions across multiple computers, networks, or VPN exits
+- control a remote workstation, server, or lab machine from your local agent
+- avoid copying datasets or using git as a development sync mechanism
 
-- The **agent host** is a Linux environment that can run Claude Code / Codex, `sshfs`/FUSE,
-  `ssh`, and standard shell tools. Ubuntu, Debian, and WSL2 are the primary targets.
-- The **remote host** only needs OpenSSH server plus a POSIX shell; no `rah` install is required
-  there.
-- Installation differs by Linux distribution: Ubuntu/Debian/WSL2 can use the guided `apt-get`
-  path, while other Linux distributions need equivalent packages from their own package manager.
+Rah does two things:
 
-Native macOS and native Windows are outside the current scope. Use a Linux gateway machine or WSL2
-when your personal device is macOS or Windows.
+- Mounts the remote project as a local folder, for example `~/mnt_rah/<project>`, so you can edit
+  remote code like local files.
+- Automatically sends the agent's shell commands to the remote machine, so tests, training jobs,
+  GPU calls, and dataset access run where the project really lives.
+
+The routing is handled by hooks, not by prompt reminders, so the agent does not need to know it is
+doing remote development. **Zero remote install:** install `rah` only on the agent machine; the
+remote only needs SSH and basic shell tools.
+
+## Machine Roles
+
+- **agent host**: the machine that runs Claude Code / Codex and `rah`.
+- **remote host**: the machine that stores the project, data, environment, and GPU, and actually
+  runs commands.
+
+**Install Rah on the agent host, not on the remote host.**
+
+The stable agent host target today is Linux with sshfs/FUSE, `ssh`, and standard shell tools:
+Ubuntu, Debian, WSL2, or a Linux gateway. Native macOS / native Windows as the agent host are not
+stable targets yet; Windows users should prefer WSL2, and macOS users can use a Linux gateway.
+
+The remote host does not need `rah`. It only needs SSH access and a project directory. A Linux
+server/workstation, or an SSH-enabled macOS machine, can be a remote target.
 
 ## Trusted agent gateway
 
-`rah` also supports a safer account model for coding agents: keep Claude Code / Codex logged in on
-one trusted machine, then reach that machine from your laptop or desktop over your own remote-access
-channel. From there, `rah` controls any server or workstation over ssh.
-
-This avoids spreading agent logins, browser sessions, API tokens, and account risk across multiple
-personal devices with different VPN exits or network locations. The agent account lives in one
-place; remote project execution still happens on the right server.
-
 If you pay for a Claude Code or Codex plan and want to use it from multiple computers, frequently
 logging the same account in from different devices, networks, or VPN exits can increase account
-risk, including security review or lockout. A steadier pattern is to choose one trusted computer as
-the **agent host**: only that A machine stays logged in to Claude Code / Codex. A separate B
-machine or server holds the real project, large datasets, model weights, and outputs. With `rah`,
-the agent on A edits B's project as if it were local, while commands really execute on B, where the
-GPU, datasets, and tuned environment already live.
+risk, including security review or lockout. Rah's recommended pattern is to keep the agent account
+on one trusted agent host. Other computers reach that host through your own remote-access channel,
+and Rah controls the real remote host from there. The account session stays in one place, while
+project files and command execution still happen on the right remote machine.
 
 <p align="center">
   <img src="assets/rah-seamless-dev.png" alt="Rah makes local coding agents work normally while hooks route commands to a remote host" width="900">
 </p>
 
-## Install
+## Install And Use
+
+### Check Your Environment
+
+- Install `rah` on the machine that runs Claude Code / Codex. Ubuntu, Debian, WSL2, or a Linux
+  gateway are the recommended environments today.
+- The remote machine only needs SSH enabled and a project directory. It does not need `rah`.
+- If your remote SSH uses a non-default port, pass `--port` during setup.
+
+### Pick One Install Option
+
+Choose one of the two options below. You do not need to run both.
+
+**Option 1: one-line terminal install (recommended)**
 
 ```bash
-# one line (re-run to upgrade)
 curl -fsSL https://raw.githubusercontent.com/Hiaa1/rah/main/install.sh | bash
 ```
 
-Prefer to read before you run? Clone and install the single file:
+Check that it works:
 
 ```bash
-git clone https://github.com/Hiaa1/rah && cd rah && ./install.sh
+rah version
 ```
 
-`rah` is a single self-contained Bash script — auditable in one file, and `scp`-able to any host.
+If your shell cannot find `rah`, reopen the terminal or add `~/.local/bin` to `PATH`.
 
-### Platform notes
+**Option 2: ask Claude Code / Codex to install it**
 
-The supported runtime is Linux with sshfs/FUSE and the required command-line tools. On Ubuntu,
-Debian, and WSL2, `rah setup` can offer to install missing local packages with `sudo apt-get`.
-On other Linux distributions, install the equivalent packages yourself before running setup.
+In an agent session, say:
 
-### Or just ask your agent
+> **"Install Rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`."**
 
-In any Claude Code / Codex session, one sentence is enough — no pre-install needed:
+The agent can download rah and prepare the commands. If it needs `sudo`, an SSH password, or
+`ssh-copy-id`, run the command it prints in a real terminal once.
 
-> **"Install rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`."**
+### Connect Your First Remote Project
 
-The agent follows this README: it checks passwordless ssh (and walks you through `ssh-copy-id` if
-it's missing — you enter the remote password that one time), installs rah, and runs `rah setup`.
-You're asked only for the remote, that one ssh authorization, and a single restart the first time.
-
-## Quickstart
-
-One command starts the guided setup. It asks for your ssh target, optional port, remote project
-path, and local mount directory, then checks dependencies, wires your installed agents, mounts,
-and prints the exact command it is executing:
+Run this in a real terminal:
 
 ```bash
 rah setup
 ```
 
-For scripts or repeatable setup, pass everything explicitly:
+It asks for:
+
+- SSH target, for example `you@devbox.example.com`
+- SSH port, or press Enter for the default
+- Remote project directory, for example `~/project`
+- Local mount directory, or press Enter for the default `~/mnt_rah/<project>`
+
+If you already know the values, you can do it in one line:
 
 ```bash
 rah setup you@host:~/project
 rah setup --port 2222 you@devbox.example.com:~/project
-```
-
-> **Run `rah setup` in a real terminal — not inside the coding agent.** It walks you through any
-> missing prerequisite behind a `[Y/n]` prompt: installing dependencies (`sudo apt`), generating
-> and authorizing your ssh key (`ssh-copy-id`), or creating a custom local mount directory if it
-> needs `sudo`. Those steps need a TTY to read a password, and a coding agent's shell — including
-> Claude Code's `!` — has **no TTY**, so they fail there. Add `-y` to assume yes. (Run headless,
-> `rah setup` detects the missing terminal and prints the one human step instead of hanging.)
-
-By default, the local mount lands at `~/mnt_rah/<project>`. To choose your own local directory,
-pass it explicitly:
-
-```bash
 rah setup you@host:~/project ~/projects/project
 ```
 
-For strict identical local/remote paths, opt in with `--same-path`.
+> `rah setup` may install local dependencies, authorize your SSH key, or create a local directory.
+> Those steps can ask for a password, so run setup in a real terminal, not inside an agent shell
+> without a TTY.
 
-Deploy once in a terminal; after that, day-to-day use is all through the agent (it never needs a
-TTY or `sudo`).
+### Start Developing
 
-Then launch your agent from inside the mountpoint. Its file tools hit the mount; its commands
-run on the remote. The hook is installed once (restart the agent that first time); after that,
-mounting a new project activates routing immediately — no restart. To remove everything: `rah uninstall`.
-
-Check the setup before handing it to an agent:
+After setup, enter the local mount:
 
 ```bash
 cd ~/mnt_rah/project
 rah verify
 ```
 
-Prefer the explicit steps? `rah doctor` -> `rah init claude` (or `codex`) ->
-`rah mount user@host:~/project ~/projects/project`.
+When verification passes, start Claude Code / Codex from this directory. Use the agent normally:
+
+- the agent sees a local folder
+- files actually come from the remote project
+- shell commands actually execute on the remote
+
+Restart the agent once after the first hook install. After that, new projects only need another
+`rah setup` or `rah mount`; the agent does not need to be configured again. To remove everything,
+run `rah uninstall`.
 
 ## Commands
 
@@ -230,13 +233,14 @@ target path for rah today; use the interactive CLI/TUI for transparent remote ex
 
 ## Requirements
 
-- **Supported local OS:** Linux with sshfs/FUSE support; primary target is Ubuntu, Debian, and WSL2.
-  Native macOS and native Windows are not supported.
+- **Supported agent host:** Linux with sshfs/FUSE support; primary target is Ubuntu, Debian, WSL2,
+  or a Linux gateway. Native macOS / native Windows as the agent host are not stable targets yet.
 - **Local packages:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils` (`base64`),
   `util-linux` (`mountpoint`); `curl` for install/self-update. Run `rah doctor` to check.
 - **SSH:** passwordless key-based ssh to the remote — `ssh <host> true` must succeed without a
   prompt. `rah setup` preflights this and points you to `ssh-copy-id` if it's missing.
-- **Remote:** nothing beyond a standard OpenSSH server and a POSIX shell.
+- **Remote:** a standard OpenSSH server, POSIX shell, and `base64`. A Linux server/workstation or an
+  SSH-enabled macOS machine can be a remote target.
 
 ## Security
 
@@ -244,8 +248,8 @@ target path for rah today; use the interactive CLI/TUI for transparent remote ex
 require `permissionDecision: "allow"` for `updatedInput.command` rewrites to take effect, so
 `rah init claude` and `rah init codex` install allow-mode hooks. Commands inside a rah-managed mount
 are approved by the hook after cwd gating; outside a managed mount they pass through unchanged
-(Claude receives `defer`, while Codex receives an empty hook response). The whole tool is one
-readable Bash file; review it before install.
+(Claude receives `defer`, while Codex receives an empty hook response). Use `rah hook-log` when you
+need to inspect routing decisions.
 
 ## License
 
