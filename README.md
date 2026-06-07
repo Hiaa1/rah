@@ -48,14 +48,30 @@ One command checks dependencies, wires your installed agents, and mounts:
 rah setup you@host:/abs/path/to/project
 ```
 
-In a terminal it's interactive: it offers to install missing dependencies, generate and authorize
-your ssh key (`ssh-copy-id`), and create the mount directory with `sudo` — each behind a `[Y/n]`
-(add `-y` to assume yes). Run by an agent with no terminal, it instead prints the one human step
-and stops.
+> **Run `rah setup` in a real terminal — not inside the coding agent.** It walks you through any
+> missing prerequisite behind a `[Y/n]` prompt: installing dependencies (`sudo apt`), generating
+> and authorizing your ssh key (`ssh-copy-id`), and creating the same-path mount directory
+> (`sudo`). Those steps need a TTY to read a password, and a coding agent's shell — including
+> Claude Code's `!` — has **no TTY**, so they fail there. Add `-y` to assume yes. (Run headless,
+> `rah setup` detects the missing terminal and prints the one human step instead of hanging.)
+
+> **Tip — try it without `sudo`:** mount a throwaway path under `/tmp` (writable on both ends, so
+> no root needed): `rah setup you@host:/tmp/rah-test`. Good for a first end-to-end check before
+> committing to a real same-path project mount.
+
+Deploy once in a terminal; after that, day-to-day use is all through the agent (it never needs a
+TTY or `sudo`).
 
 Then launch your agent from inside the mountpoint. Its file tools hit the mount; its commands
 run on the remote. The hook is installed once (restart the agent that first time); after that,
 mounting a new project activates routing immediately — no restart. To remove everything: `rah uninstall`.
+
+Check the setup before handing it to an agent:
+
+```bash
+cd /abs/path/to/project
+rah verify
+```
 
 Prefer the explicit steps? `rah doctor` → `rah init claude` (or `codex`) → `rah mount user@host:/abs/path`.
 
@@ -68,11 +84,13 @@ Prefer the explicit steps? `rah doctor` → `rah init claude` (or `codex`) → `
 | `rah remount [name]` | recover a dead/stale mount (all if no name) |
 | `rah unmount <name>` | unmount + drop the ssh master |
 | `rah init <claude\|codex> [--remove]` | install/remove the hook + skill for an agent |
-| `rah status` | mount / ssh-master health |
+| `rah status` | mount / ssh / exec / agent-hook health |
+| `rah verify [name\|path]` | end-to-end mount/ssh/hook check |
 | `rah doctor` | check dependencies, PATH, mount health |
 | `rah self-update` | update to the latest version |
 | `rah uninstall [--purge]` | remove hooks, skill, and the `rah` binary |
 | `rah run --cwd <dir> -- <cmd>` | run a command on the remote (used by the hook) |
+| `rah hook-log on\|off\|status\|clear` | enable/inspect hook diagnostics |
 
 ## How it works
 
@@ -98,6 +116,32 @@ channels, **command execution keeps working** while the mount is down. To recove
   and fires a background `rah remount` if it finds it dead — so it usually recovers on its own.
 - `rah status` reports `mounted` / `DEAD` / `not mounted` (a real liveness probe, not a stale flag).
 
+## Hook diagnostics
+
+If an agent appears to run locally from inside a managed mount, enable the hook log and retry one
+command:
+
+```bash
+rah hook-log on
+rah hook-log clear
+```
+
+Then run the suspect command in the agent and inspect `~/.config/rah/hook.jsonl`. Each JSONL entry
+records whether the hook fired, the reported/effective cwd, mount match, route vs passthrough, and
+the emitted decision. Disable it with `rah hook-log off`. For one-off debugging without changing the
+flag file, launch the agent with `RAH_HOOK_LOG=1` or set it to a log path.
+
+## Agent support
+
+| Agent | Status | Hook installed by `rah init` |
+|---|---|---|
+| Claude Code v2.1.158+ | tested | `rah hook --decision allow` |
+| Codex CLI v0.137.0+ interactive TUI | tested | `rah hook --decision allow --passthrough empty` |
+
+Codex may ask you to review hooks after install or update. Choose **Trust all and continue** for the
+rah hook, then commands launched from a managed mount route to the remote. `codex exec` is not the
+target path for rah today; use the interactive CLI/TUI for transparent remote execution.
+
 ## Requirements
 
 - **Local:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils` (`base64`),
@@ -108,10 +152,12 @@ channels, **command execution keeps working** while the mount is down. To recove
 
 ## Security
 
-`rah` reroutes the agent's command execution to a remote host over ssh. By default the hook
-returns `permissionDecision: "defer"`, so it **respects your agent's normal approval flow**
-rather than auto-approving commands. Run fully autonomously only if you opt in
-(`rah hook --decision allow`). The whole tool is one readable Bash file; review it before install.
+`rah` reroutes the agent's command execution to a remote host over ssh. Claude and Codex currently
+require `permissionDecision: "allow"` for `updatedInput.command` rewrites to take effect, so
+`rah init claude` and `rah init codex` install allow-mode hooks. Commands inside a rah-managed mount
+are approved by the hook after cwd gating; outside a managed mount they pass through unchanged
+(Claude receives `defer`, while Codex receives an empty hook response). The whole tool is one
+readable Bash file; review it before install.
 
 ## License
 

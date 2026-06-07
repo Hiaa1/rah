@@ -5,11 +5,13 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.1.2"
+RAH_VERSION="0.1.7"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
 RAH_BIN_DIR="${RAH_BIN_DIR:-$HOME/.local/bin}"
+RAH_HOOK_LOG_DEFAULT="$RAH_CONFIG_DIR/hook.jsonl"
+RAH_HOOK_LOG_FLAG="$RAH_CONFIG_DIR/hook-log"
 # Required runtime dependencies as bin:apt-package (fusermount/curl handled separately).
 RAH_DEPS=(ssh:openssh-client sshfs:sshfs jq:jq base64:coreutils timeout:coreutils mountpoint:util-linux)
 
@@ -84,6 +86,64 @@ _mount_state() {
 
 # Passwordless ssh reachability probe (BatchMode: never blocks on a password prompt).
 _ssh_ok() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" true 2>/dev/null; }
+
+# Print the active hook log path. Logging is disabled unless RAH_HOOK_LOG is set
+# or `rah hook-log on` has written a flag file.
+_hook_log_path() {
+  local v
+  if [ "${RAH_HOOK_LOG+x}" ]; then
+    v="$RAH_HOOK_LOG"
+    case "$v" in ""|0|false|False|FALSE|off|OFF|no|NO) return 1 ;; esac
+  else
+    [ -f "$RAH_HOOK_LOG_FLAG" ] || return 1
+    v="$(sed -n '1p' "$RAH_HOOK_LOG_FLAG" 2>/dev/null)"
+    [ -n "$v" ] || v=1
+  fi
+
+  case "$v" in
+    1|true|True|TRUE|on|ON|yes|YES) printf '%s\n' "$RAH_HOOK_LOG_DEFAULT" ;;
+    *) printf '%s\n' "$v" ;;
+  esac
+}
+
+_hook_log_event() {
+  local tool="$1" reported_cwd="$2" tool_cwd="$3" effective_cwd="$4" matched="$5" cfg="$6"
+  local action="$7" reason="$8" configured_decision="$9" emitted_decision="${10}" updated="${11}" command="${12}"
+  local path dir command_log truncated=0
+  path="$(_hook_log_path)" || return 0
+  dir="$(dirname "$path")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+
+  command_log="$command"
+  if [ "${#command_log}" -gt 1000 ]; then
+    command_log="${command_log:0:1000}"
+    truncated=1
+  fi
+
+  jq -nc \
+    --arg ts "$(date -Is 2>/dev/null || date)" \
+    --arg pid "$$" \
+    --arg tool "$tool" \
+    --arg pwd "$PWD" \
+    --arg reported_cwd "$reported_cwd" \
+    --arg tool_input_cwd "$tool_cwd" \
+    --arg effective_cwd "$effective_cwd" \
+    --arg cfg "$cfg" \
+    --arg action "$action" \
+    --arg reason "$reason" \
+    --arg configured_decision "$configured_decision" \
+    --arg emitted_decision "$emitted_decision" \
+    --arg command "$command_log" \
+    --argjson matched_mount "$matched" \
+    --argjson updated_input "$updated" \
+    --argjson command_truncated "$truncated" \
+    '{ts:$ts,pid:($pid|tonumber),event:"PreToolUse",triggered:true,tool:$tool,pwd:$pwd,
+      reported_cwd:$reported_cwd,tool_input_cwd:$tool_input_cwd,effective_cwd:$effective_cwd,
+      matched_mount:$matched_mount,config:(if $cfg == "" then null else $cfg end),
+      action:$action,reason:$reason,configured_decision:$configured_decision,
+      emitted_decision:$emitted_decision,updated_input:$updated_input,
+      command:$command,command_truncated:$command_truncated}' >> "$path" 2>/dev/null || true
+}
 
 # Space-separated apt packages for any missing required deps (deduped; empty if all present).
 _missing_pkgs() {
@@ -290,24 +350,34 @@ cmd_run() {
 
 cmd_hook() {
   set +e
-  local decision="defer"
+  local decision="defer" passthrough_output="defer"
   while [ $# -gt 0 ]; do
     case "$1" in
       --decision) decision="$2"; shift 2 ;;
+      --passthrough) passthrough_output="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   case "$decision" in defer|allow|ask) ;; *) decision="defer" ;; esac
+  case "$passthrough_output" in defer|empty) ;; *) passthrough_output="defer" ;; esac
 
-  local input cmd cwd
+  local input cmd cwd reported_cwd tool_cwd tool
   input="$(cat)"
+  tool="$(printf '%s' "$input" | jq -r '.tool_name // .tool // .toolName // empty' 2>/dev/null)"
   cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
-  cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+  reported_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+  tool_cwd="$(printf '%s' "$input" | jq -r '.tool_input.cwd // empty' 2>/dev/null)"
+  cwd="$reported_cwd"
   [ -n "$cwd" ] || cwd="$PWD"
 
-  local passthrough=0 cfg=""
-  cfg="$(_config_for_cwd "$cwd" 2>/dev/null)" || passthrough=1
-  case "$cmd" in rah|"rah "*) passthrough=1 ;; esac
+  local passthrough=0 cfg="" matched=0 reason=""
+  if cfg="$(_config_for_cwd "$cwd" 2>/dev/null)"; then
+    matched=1
+  else
+    passthrough=1
+    reason="no-managed-mount"
+  fi
+  case "$cmd" in rah|"rah "*) passthrough=1; reason="rah-command" ;; esac
 
   # Opportunistic, throttled, non-blocking mount self-heal (file plane only).
   # Runs at most once per 10s; if the mount is dead, fire a detached remount and
@@ -334,11 +404,19 @@ cmd_hook() {
     cd|cd\ *|pushd|pushd\ *|popd|popd\ *)
       case "$cmd" in
         *'&&'*|*';'*|*'|'*|*$'\n'*) : ;;
-        *) passthrough=1 ;;
+        *) passthrough=1; reason="navigation" ;;
       esac ;;
   esac
 
   if [ "$passthrough" -eq 1 ] || [ -z "$cmd" ]; then
+    [ -n "$cmd" ] || reason="empty-command"
+    local emitted="defer"
+    [ "$passthrough_output" = "empty" ] && emitted=""
+    _hook_log_event "$tool" "$reported_cwd" "$tool_cwd" "$cwd" "$matched" "$cfg" \
+      "passthrough" "$reason" "$decision" "$emitted" 0 "$cmd"
+    if [ "$passthrough_output" = "empty" ]; then
+      return 0
+    fi
     jq -nc '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"defer"}}'
     return 0
   fi
@@ -352,8 +430,49 @@ cmd_hook() {
     *)
       newcmd="rah run --cwd $(_shq "$cwd") -- $cmd" ;;
   esac
+  _hook_log_event "$tool" "$reported_cwd" "$tool_cwd" "$cwd" "$matched" "$cfg" \
+    "route" "managed-mount" "$decision" "$decision" 1 "$cmd"
   jq -nc --arg c "$newcmd" --arg d "$decision" \
     '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,updatedInput:{command:$c}}}'
+}
+
+cmd_hook_log() {
+  local action="${1:-status}" path="${2:-}"
+  case "$action" in
+    on)
+      [ -n "$path" ] || path="$RAH_HOOK_LOG_DEFAULT"
+      mkdir -p "$RAH_CONFIG_DIR" "$(dirname "$path")"
+      printf '%s\n' "$path" > "$RAH_HOOK_LOG_FLAG"
+      : >> "$path" || _die "cannot write hook log: $path"
+      echo "rah: hook log enabled: $path"
+      ;;
+    off)
+      rm -f "$RAH_HOOK_LOG_FLAG"
+      echo "rah: hook log disabled"
+      ;;
+    status|path)
+      if path="$(_hook_log_path)"; then
+        echo "rah: hook log enabled: $path"
+      else
+        echo "rah: hook log disabled"
+      fi
+      ;;
+    clear)
+      if [ -n "$path" ]; then
+        :
+      elif path="$(_hook_log_path 2>/dev/null)"; then
+        :
+      else
+        path="$RAH_HOOK_LOG_DEFAULT"
+      fi
+      mkdir -p "$(dirname "$path")"
+      : > "$path" || _die "cannot clear hook log: $path"
+      echo "rah: hook log cleared: $path"
+      ;;
+    *)
+      _die "usage: rah hook-log on [path] | off | status | clear [path]"
+      ;;
+  esac
 }
 
 # ---------- init (install/remove hook + skill for an agent) ----------
@@ -372,18 +491,22 @@ _ensure_path() {
 _hook_present() {
   local file="$1"
   [ -f "$file" ] || return 1
-  jq -e '(.hooks.PreToolUse // []) | any(.[]; (.hooks // []) | any(.command == "rah hook"))' \
+  jq -e '(.hooks.PreToolUse // []) | any(.[]; (.hooks // []) | any(.command | startswith("rah hook")))' \
     "$file" >/dev/null 2>&1
 }
 
-# Add our {matcher:"Bash", hooks:[{command:"rah hook"}]} group to .hooks.PreToolUse, idempotently.
+# Add/update our {matcher:"Bash", hooks:[{command:<hc>}]} group in .hooks.PreToolUse, idempotently.
 _merge_hook_json() {
-  local file="$1" tmp; tmp="$(mktemp)"
+  local file="$1" hc="$2" matcher="$3" tmp; tmp="$(mktemp)"
   [ -f "$file" ] || echo '{}' > "$file"
-  jq '
+  jq --arg hc "$hc" --arg matcher "$matcher" '
     .hooks.PreToolUse = ((.hooks.PreToolUse // [])
-      | if any(.[]; (.hooks // []) | any(.command == "rah hook")) then .
-        else . + [{matcher:"Bash", hooks:[{type:"command", command:"rah hook"}]}] end)
+      | map(if ((.hooks // []) | any(.command | startswith("rah hook"))) then
+          .matcher = $matcher
+          | .hooks |= map(if (.command | startswith("rah hook")) then .command = $hc else . end)
+        else . end)
+      | if any(.[]; (.hooks // []) | any(.command | startswith("rah hook"))) then .
+        else . + [{matcher:$matcher, hooks:[{type:"command", command:$hc}]}] end)
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
@@ -394,14 +517,14 @@ _remove_hook_json() {
   tmp="$(mktemp)"
   jq '
     if (.hooks.PreToolUse | type) == "array" then
-      .hooks.PreToolUse |= ( map(.hooks |= map(select(.command != "rah hook")))
+      .hooks.PreToolUse |= ( map(.hooks |= map(select((.command | startswith("rah hook")) | not)))
                              | map(select((.hooks // [] | length) > 0)) )
     else . end
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
 _init_agent() {
-  local label="$1" home="$2" cfg="$3" skilldir="$4" remove="$5"
+  local label="$1" home="$2" cfg="$3" skilldir="$4" remove="$5" hookcmd="$6" matcher="$7"
   if [ "$remove" -eq 1 ]; then
     _remove_hook_json "$cfg"
     rm -rf "$skilldir"
@@ -409,7 +532,7 @@ _init_agent() {
   else
     _ensure_path
     mkdir -p "$home" "$skilldir"
-    _merge_hook_json "$cfg"
+    _merge_hook_json "$cfg" "$hookcmd" "$matcher"
     _skill_doc > "$skilldir/SKILL.md"
     echo "rah: $label hook + skill installed ($home)"
   fi
@@ -425,8 +548,8 @@ cmd_init() {
     esac
   done
   case "$agent" in
-    claude) _init_agent "Claude" "$HOME/.claude" "$HOME/.claude/settings.json" "$HOME/.claude/skills/rah" "$remove" ;;
-    codex)  _init_agent "Codex"  "$HOME/.codex"  "$HOME/.codex/hooks.json"     "$HOME/.codex/skills/rah"  "$remove" ;;
+    claude) _init_agent "Claude" "$HOME/.claude" "$HOME/.claude/settings.json" "$HOME/.claude/skills/rah" "$remove" "rah hook --decision allow" "Bash" ;;
+    codex)  _init_agent "Codex"  "$HOME/.codex"  "$HOME/.codex/hooks.json"     "$HOME/.codex/skills/rah"  "$remove" "rah hook --decision allow --passthrough empty" "Bash|command_execution" ;;
     *)      _die "usage: rah init <claude|codex> [--remove]" ;;
   esac
 }
@@ -525,12 +648,69 @@ cmd_setup() {
   else
     echo "rah: ready — routing is live now, no restart needed."
   fi
+  echo
+  echo "next:"
+  echo "  cd $remote_path"
+  echo "  rah verify"
+  echo "  codex   # or: claude"
+  echo "  then ask the agent to run: nvidia-smi"
 }
 
 # ---------- status / doctor ----------
 
+_agent_hook_status() {
+  local label="$1" cfg="$2" expected_cmd="$3" expected_matcher="$4"
+  printf '  %-10s ' "$label"
+  if [ ! -f "$cfg" ]; then
+    echo "[not installed — run: rah init ${label,,}]"
+    return 1
+  fi
+  if jq -e --arg cmd "$expected_cmd" --arg matcher "$expected_matcher" '
+      (.hooks.PreToolUse // [])
+      | any(.[]; (.matcher // "") == $matcher and ((.hooks // []) | any(.command == $cmd)))
+    ' "$cfg" >/dev/null 2>&1; then
+    echo "[installed]"
+    return 0
+  fi
+  if _hook_present "$cfg"; then
+    echo "[needs update — run: rah init ${label,,}]"
+  else
+    echo "[missing — run: rah init ${label,,}]"
+  fi
+  return 1
+}
+
+_cfg_from_arg_or_cwd() {
+  local arg="${1:-}" cfg="" count=0 last=""
+  if [ -n "$arg" ]; then
+    if [ -f "$RAH_CONFIG_DIR/$arg.env" ]; then
+      printf '%s\n' "$RAH_CONFIG_DIR/$arg.env"; return 0
+    fi
+    if cfg="$(_config_for_cwd "$arg" 2>/dev/null)"; then
+      printf '%s\n' "$cfg"; return 0
+    fi
+    return 1
+  fi
+
+  if cfg="$(_config_for_cwd "$PWD" 2>/dev/null)"; then
+    printf '%s\n' "$cfg"; return 0
+  fi
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    count=$((count + 1)); last="$cfg"
+  done < <(_list_configs)
+  [ "$count" -eq 1 ] && { printf '%s\n' "$last"; return 0; }
+  return 1
+}
+
+_exec_plane_ok() {
+  local mp="$1"
+  timeout 15 "$(_self_path)" run --cwd "$mp" -- true >/dev/null 2>&1
+}
+
 cmd_status() {
-  local any=0 cfg name host mp socket
+  local any=0 cfg name host mp socket state
+  echo "rah status (v$RAH_VERSION)"
   while IFS= read -r cfg; do
     [ -n "$cfg" ] || continue
     any=1
@@ -539,15 +719,99 @@ cmd_status() {
     printf '● %s\n' "$name"
     printf '  host:       %s\n' "$host"
     printf '  mountpoint: %s ' "$mp"
-    case "$(_mount_state "$mp")" in
+    state="$(_mount_state "$mp")"
+    case "$state" in
       mounted) printf '[mounted]\n' ;;
       dead)    printf '[DEAD — run: rah remount %s]\n' "$name" ;;
       *)       printf '[not mounted]\n' ;;
     esac
     printf '  ssh:        '
     if _ssh_ok "$host"; then printf '[reachable]\n'; else printf '[NO passwordless ssh — run: ssh-copy-id %s]\n' "$host"; fi
+    printf '  exec:       '
+    if _exec_plane_ok "$mp"; then printf '[remote ok]\n'; else printf '[FAILED — run: rah verify %s]\n' "$name"; fi
   done < <(_list_configs)
   [ "$any" -eq 1 ] || echo "rah: no managed mounts (run: rah mount user@host:/abs/path)"
+  echo "agents:"
+  _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" || true
+  _agent_hook_status "codex" "$HOME/.codex/hooks.json" "rah hook --decision allow --passthrough empty" "Bash|command_execution" || true
+  if _hook_log_path >/dev/null 2>&1; then
+    echo "  hook-log   [on — run: rah hook-log off]"
+  else
+    echo "  hook-log   [off]"
+  fi
+}
+
+cmd_verify() {
+  local target="${1:-}" cfg name host mp ok=1 out hook_out outside
+  if ! cfg="$(_cfg_from_arg_or_cwd "$target")"; then
+    _die "verify: no target mount found (run inside a mount, or: rah verify <name|path>)"
+  fi
+  name="$(basename "$cfg" .env)"
+  host="$(_get "$cfg" host)"; mp="$(_get "$cfg" mountpoint)"
+
+  echo "rah verify (v$RAH_VERSION) — $name"
+  printf '  deps:       '
+  if [ -z "$(_missing_pkgs)" ]; then echo "[ok]"; else echo "[MISSING — run: rah doctor]"; ok=0; fi
+
+  printf '  mount:      '
+  case "$(_mount_state "$mp")" in
+    mounted) echo "[mounted] $mp" ;;
+    dead)    echo "[DEAD — run: rah remount $name]"; ok=0 ;;
+    *)       echo "[not mounted — run: rah remount $name]"; ok=0 ;;
+  esac
+
+  printf '  ssh:        '
+  if _ssh_ok "$host"; then echo "[reachable] $host"; else echo "[FAILED — run: ssh-copy-id $host]"; ok=0; fi
+
+  printf '  exec:       '
+  if out="$(timeout 15 "$(_self_path)" run --cwd "$mp" -- printf rah-remote-ok 2>/dev/null)" && [ "$out" = "rah-remote-ok" ]; then
+    echo "[remote ok]"
+  else
+    echo "[FAILED — explicit rah run did not complete]"
+    ok=0
+  fi
+
+  printf '  hook route: '
+  hook_out="$(jq -nc --arg cwd "$mp" --arg cmd "printf rah-hook-ok" \
+      '{tool_name:"Bash",cwd:$cwd,tool_input:{command:$cmd}}' \
+    | "$(_self_path)" hook --decision allow --passthrough empty 2>/dev/null)"
+  if printf '%s' "$hook_out" | jq -e '.hookSpecificOutput.permissionDecision == "allow" and (.hookSpecificOutput.updatedInput.command | startswith("rah run --cwd "))' >/dev/null 2>&1; then
+    echo "[ok]"
+  else
+    echo "[FAILED — hook did not rewrite a managed cwd]"
+    ok=0
+  fi
+
+  printf '  codex pass: '
+  outside="$(mktemp -d)"
+  hook_out="$(jq -nc --arg cwd "$outside" --arg cmd "printf local-ok" \
+      '{tool_name:"Bash",cwd:$cwd,tool_input:{command:$cmd}}' \
+    | "$(_self_path)" hook --decision allow --passthrough empty 2>/dev/null)"
+  rmdir "$outside" 2>/dev/null || true
+  if [ -z "$hook_out" ]; then echo "[ok]"; else echo "[FAILED — Codex passthrough was not empty]"; ok=0; fi
+
+  printf '  claude:     '
+  if _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" >/dev/null; then
+    echo "[hook installed]"
+  else
+    echo "[not ready — run: rah init claude]"
+    ok=0
+  fi
+
+  printf '  codex:      '
+  if _agent_hook_status "codex" "$HOME/.codex/hooks.json" "rah hook --decision allow --passthrough empty" "Bash|command_execution" >/dev/null; then
+    echo "[hook installed]"
+  else
+    echo "[not ready — run: rah init codex]"
+    ok=0
+  fi
+
+  if [ "$ok" -eq 1 ]; then
+    echo "rah: verify passed"
+  else
+    echo "rah: verify found issues"
+    return 1
+  fi
 }
 
 _check_dep() {  # name pkg required(0|1) ; prints status, returns non-zero if missing
@@ -624,9 +888,12 @@ rah — Remote as Host (v$RAH_VERSION)
   rah remount [name]                                         recover a dead mount (all if no name)
   rah unmount <name>                                         unmount + drop ssh master
   rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
-  rah hook [--decision defer|allow|ask]                      PreToolUse rewrite (reads JSON on stdin)
+  rah hook [--decision defer|allow|ask] [--passthrough defer|empty]
+                                                                PreToolUse rewrite (reads JSON on stdin)
+  rah hook-log on [path] | off | status | clear [path]       enable/inspect hook diagnostics
   rah init <claude|codex> [--remove]                         install/remove hook + skill for an agent
-  rah status                                                 show mounts / ssh master health
+  rah status                                                 show mount / ssh / exec / agent-hook health
+  rah verify [name|path]                                     end-to-end mount/ssh/hook check
   rah doctor                                                 check dependencies, PATH, mount health
   rah self-update                                            update rah to the latest version
   rah uninstall [--purge]                                    remove hooks, skill, and the rah binary
@@ -643,8 +910,10 @@ main() {
     unmount)     cmd_unmount "$@" ;;
     run)         cmd_run "$@" ;;
     hook)        cmd_hook "$@" ;;
+    hook-log)    cmd_hook_log "$@" ;;
     init)        cmd_init "$@" ;;
     status)      cmd_status "$@" ;;
+    verify)      cmd_verify "$@" ;;
     doctor)      cmd_doctor "$@" ;;
     self-update) cmd_self_update "$@" ;;
     uninstall)   cmd_uninstall "$@" ;;
