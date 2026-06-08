@@ -15,11 +15,50 @@
 Rah lets Claude Code / Codex develop as if it were on a remote machine, while the agent account
 stays logged in on one machine you choose.
 
-Typical setup:
+## Usage Scenarios
 
-- Machine A runs Claude Code / Codex and installs `rah`.
-- Machine B or a server holds the real project, large datasets, model weights, and GPU environment.
-- You use the agent normally on A; files come from B, and commands execute on B.
+### 1. Personal Computer To Remote Workstation
+
+For users who want to use a personal Mac/Ubuntu machine while doing the real work on a remote
+workstation, server, or lab machine.
+
+- **Machine A**: your local Mac/Ubuntu/WSL2/Linux gateway. It runs Claude Code / Codex and installs
+  `rah`.
+- **Machine B**: the remote development host. It stores the code, datasets, model weights, and GPU
+  environment, and only needs SSH enabled.
+- On machine A, use `rah` to mount machine B's project, for example under `~/mnt_rah/<project>`.
+- On machine A, enter that mounted directory and start Claude Code / Codex. The agent reads and
+  writes B's files, and commands execute on B.
+
+### 2. Shared Agent Host For Multiple Users
+
+For teams or labs that want to keep Claude Code / Codex sessions centralized on one trusted host.
+
+- **A1, A2, A3...**: each person's own computer. It only needs SSH access to the shared agent host.
+- **Machine B**: the shared agent host. It installs Claude Code / Codex and `rah`, and acts as the
+  common development entry point.
+- **C1, C2, C3...**: each person's own code host, workstation, or server, storing their project,
+  data, and environment.
+- Each user SSHes from their own computer to B, then uses `rah` to mount their Cj project into a
+  personal working directory on B.
+- Each user starts Claude Code / Codex from their own directory on B. Files come from their own Cj,
+  and commands execute on their own Cj.
+
+## Supported Now / TODO
+
+- [x] **Recommended mode: shared Linux agent host.** Install Claude Code / Codex and `rah` on one
+  Linux machine B. Other computers A1/A2/A3... SSH into B; B mounts each user's remote workspace Cj
+  into a personal working directory. Cj can be Linux/macOS, or Windows/WSL2 if it provides
+  SSH/SFTP plus a Unix-like shell environment.
+- [x] **Personal mode: Linux/macOS agent host + remote Linux dev box.** Install Claude Code / Codex
+  and `rah` on your own Linux or macOS work machine, mount the remote Linux workstation/GPU server,
+  then start the agent from the mounted directory.
+- [x] **macOS as the agent host.** Rah can run on macOS through macFUSE + SSHFS; the installer
+  points to Homebrew, MacPorts, or manual install paths.
+- [ ] **Native Windows as the agent host.** Not supported yet; Windows users should prefer WSL2 or
+  SSH into a Linux agent host.
+- [ ] **Native Windows as the remote host.** Only experimental when SSH/SFTP and a Unix-like
+  shell/base64 environment are available; a normal Windows shell is not a stable target today.
 
 Use Rah if you want to:
 
@@ -97,6 +136,13 @@ On macOS, if SSHFS is missing, the installer points you to the right path for yo
 Homebrew, MacPorts, or manual macFUSE + SSHFS installers. macFUSE may require approval in System
 Settings before the first mount works. To force a path, set `RAH_MACOS_SSHFS_INSTALLER=brew`,
 `macports`, or `manual`.
+
+If macFUSE shows a **System Extension Blocked** prompt on the first mount, choose **Open System
+Settings**, allow the macFUSE system extension in Privacy & Security, then try the mount again:
+
+<p align="center">
+  <img src="assets/mac-deploy-fuse.png" alt="macOS macFUSE System Extension Blocked permission prompt" width="620">
+</p>
 
 **Option 2: ask Claude Code / Codex to install it**
 

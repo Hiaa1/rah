@@ -14,11 +14,34 @@
 
 Rah 让 Claude Code / Codex 像在远端机器上一样开发项目，但账号只登录在你指定的一台电脑上。
 
-典型场景：
+## 使用场景
 
-- A 电脑运行 Claude Code / Codex，并安装 `rah`。
-- B 电脑或服务器保存真实项目、大数据集、模型权重和 GPU 环境。
-- 你在 A 上正常使用 agent；文件来自 B，命令也在 B 上执行。
+### 1. 个人电脑接入远程开发主机
+
+适合用个人 Mac/Ubuntu 电脑远程 workstation、服务器或实验机器干活的用户。
+
+- **主机 A**：你的本地 Mac/Ubuntu/WSL2/Linux gateway，运行 Claude Code / Codex，并安装 `rah`。
+- **主机 B**：远程开发主机，存放代码、数据集、模型权重和 GPU 环境，只需要开启 SSH。
+- 在主机 A 上用 `rah` 挂载主机 B 的项目目录，例如挂到 `~/mnt_rah/<project>`。
+- 你在主机 A 进入这个挂载目录启动 Claude Code / Codex；agent 读写的是 B 的文件，命令也在 B 上执行。
+
+### 2. 共享 agent 主机作为多人入口
+
+适合团队或实验室把 Claude Code / Codex 登录态集中在一台可信主机上的用法。
+
+- **A1、A2、A3...**：每个人自己的电脑，只需要能 SSH 连接到共享 agent 主机。
+- **主机 B**：共享 agent 主机，安装 Claude Code / Codex 和 `rah`，作为统一的开发入口。
+- **C1、C2、C3...**：每个人自己的代码主机、工作站或服务器，分别存放各自项目、数据和环境。
+- 用户从自己的电脑 SSH 到主机 B，再用 `rah` 把自己的 Cj 项目挂载到 B 上的个人工作目录。
+- 每个人都在主机 B 的个人工作目录里启动 Claude Code / Codex；文件来自各自的 Cj，命令也在各自的 Cj 上执行。
+
+## 当前支持 / TODO
+
+- [x] **推荐模式：Linux 共享 agent host。** 在一台 Linux 主机 B 上安装 Claude Code / Codex 和 `rah`，其它电脑 A1/A2/A3... 通过 SSH 登录 B；B 再把各自的远端工作目录 Cj 挂载到个人工作目录中使用。远端 Cj 可以是 Linux/macOS，或提供 SSH/SFTP 与类 Unix shell 环境的 Windows/WSL2。
+- [x] **个人模式：本机 Linux/macOS agent host + 远程 Linux 开发机。** 在自己的 Linux 或 macOS 办公机上安装 Claude Code / Codex 和 `rah`，把远程 Linux workstation/GPU 服务器的工作目录挂载到本机，然后从挂载目录启动 agent。
+- [x] **macOS 作为 agent host。** macOS 可通过 macFUSE + SSHFS 使用 Rah；安装器会提示 Homebrew、MacPorts 或手动安装路径。
+- [ ] **原生 Windows 作为 agent host。** 暂不支持；Windows 用户优先使用 WSL2，或 SSH 到一台 Linux agent host。
+- [ ] **原生 Windows 作为 remote host。** 仅在具备 SSH/SFTP 和类 Unix shell/base64 环境时可尝试；普通 Windows 原生命令环境不是当前稳定目标。
 
 适合你如果：
 
@@ -84,6 +107,12 @@ rah version
 如果提示找不到 `rah`，重新打开终端，或者把 `~/.local/bin` 加到 `PATH`。
 
 macOS 上如果缺少 SSHFS，安装器会按你的机器给出 Homebrew、MacPorts 或手动安装 macFUSE + SSHFS 的路径。macFUSE 第一次挂载前可能需要在系统设置里批准。需要强制选择路径时，可以设置 `RAH_MACOS_SSHFS_INSTALLER=brew`、`macports` 或 `manual`。
+
+如果第一次挂载时看到 macFUSE 的 **System Extension Blocked** 提示，点击 **Open System Settings**，在系统设置的隐私与安全性里允许 macFUSE 系统扩展，然后重新尝试挂载：
+
+<p align="center">
+  <img src="assets/mac-deploy-fuse.png" alt="macOS macFUSE System Extension Blocked permission prompt" width="620">
+</p>
 
 **方式二：让 Claude Code / Codex 帮你安装**
 
