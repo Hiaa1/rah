@@ -5,7 +5,7 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.2.0"
+RAH_VERSION="0.3.0"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
@@ -525,6 +525,25 @@ _explain_ssh_failure() {
     printf '%b\n' "  ${RAH_CYAN}ssh -o BatchMode=yes -o ConnectTimeout=5 $host true${RAH_RESET}" >&2
   fi
   echo "  if you normally use an ssh alias, use that alias in the rah target." >&2
+  _suggest_nat_traversal >&2
+}
+
+# Guidance for when the remote cannot accept inbound ssh because it sits behind
+# NAT / has no public IP. rah needs a reachable ssh destination; NAT traversal is
+# solved one layer below rah (an overlay network or a reverse tunnel) and then
+# consumed through an ~/.ssh/config alias. Prints to stdout; callers redirect to
+# stderr where the surrounding output goes there.
+_suggest_nat_traversal() {
+  printf '%b\n' "  ${RAH_DIM}remote behind NAT / no public IP? it cannot accept inbound ssh —${RAH_RESET}"
+  printf '%b\n' "  ${RAH_DIM}give it reachability one layer below rah, then point rah at the alias:${RAH_RESET}"
+  if command -v tailscale >/dev/null 2>&1; then
+    printf '%b\n' "    ${RAH_CYAN}tailscale status${RAH_RESET}   # Tailscale (recommended): find the remote's MagicDNS name"
+  else
+    printf '%b\n' "    ${RAH_CYAN}# Tailscale (recommended): install on both ends -> https://tailscale.com/download${RAH_RESET}"
+  fi
+  printf '%b\n' "    ${RAH_CYAN}# or reverse SSH tunnel: remote runs 'autossh -M 0 -R 2222:localhost:22 relay'${RAH_RESET}"
+  printf '%b\n' "  ${RAH_DIM}put HostName/Port/ProxyJump in ~/.ssh/config under 'Host myremote', then:${RAH_RESET}"
+  printf '%b\n' "    ${RAH_CYAN}rah setup myremote:/path${RAH_RESET}"
 }
 
 _authorize_ssh_key() {
@@ -664,6 +683,19 @@ If file tools fail with `Transport endpoint is not connected` or hang, the mount
 `rah remount` (it executes locally) and retry. Command execution over ssh keeps working even
 while the mount is down, since it is a separate channel.
 
+## Remote behind NAT
+
+If ssh to the remote fails because it is behind NAT / has no public IP (it cannot accept
+inbound ssh), rah cannot reach it directly. Tell the user to give it reachability one layer
+below rah, then use an `~/.ssh/config` alias:
+- **Tailscale (recommended):** install on both machines, `tailscale up`, then use the
+  remote's MagicDNS name. Works even when both ends are behind NAT (no public IP/VPS needed).
+- **Reverse SSH tunnel:** the remote runs `autossh -M 0 -R 2222:localhost:22 <relay>` to a
+  public relay; reach it via `HostName localhost`/`Port 2222` or `ProxyJump <relay>`.
+
+Put HostName/Port/ProxyJump in `~/.ssh/config` under `Host <alias>`, then run
+`rah setup <alias>:/path` — both exec and the sshfs mount inherit it; rah needs no extra flags.
+
 ## Notes
 
 - Only the **code tree** is mounted; datasets/outputs stay on the remote and are reached
@@ -739,6 +771,8 @@ cmd_mount() {
   case "$port" in ""|*[!0-9]*) [ -z "$port" ] || _die "--port must be numeric: $port" ;; esac
 
   case "$target" in *:*) ;; *) _die "expected user@host:/path or user@host:~/path, got: $target" ;; esac
+  # host may be an ~/.ssh/config alias; custom Port/ProxyJump/ProxyCommand live in
+  # ssh_config and are inherited by both ssh and sshfs (see "Remote behind NAT" docs).
   local host="${target%%:*}" remote_raw="${target#*:}" remote_path
   if ! _ssh_ok "$host" "$port"; then
     _explain_ssh_failure "$host" "$port"
@@ -1219,7 +1253,8 @@ cmd_setup() {
 	  done
 	  [ "$agents_seen" -eq 1 ] || _say_warn "no Claude/Codex config directory found yet; run 'rah init claude' or 'rah init codex' after installing the agent"
 
-	  # 3) Remote target.
+	  # 3) Remote target. host may be an ~/.ssh/config alias; Port/ProxyJump live in
+	  #    ssh_config and are inherited by both ssh and sshfs (see "Remote behind NAT").
 	  local host="${target%%:*}" remote_raw="${target#*:}" remote_path=""
 
 	  # 4) SSH must be passwordless. In a terminal, offer to generate + authorize a key;
@@ -1237,7 +1272,7 @@ cmd_setup() {
 	      if _confirm "authorize your key on $host now? (you'll enter the remote password once)"; then
 	        _authorize_ssh_key "$host" "$port" || true
 	      fi
-	      _ssh_ok "$host" "$port" || { _say_fail "still cannot use non-interactive ssh to $host"; _say_cmd "rah setup $target"; return 1; }
+	      _ssh_ok "$host" "$port" || { _say_fail "still cannot use non-interactive ssh to $host"; _say_cmd "rah setup $target"; _suggest_nat_traversal; return 1; }
 	    else
 	      if [ -n "$port" ]; then
 	        _say_cmd "ssh -p $port -o BatchMode=yes -o ConnectTimeout=5 $host true"
@@ -1245,6 +1280,7 @@ cmd_setup() {
 	        _say_cmd "ssh -o BatchMode=yes -o ConnectTimeout=5 $host true"
 	      fi
 	      _say_note "if you normally use an ssh alias, use that alias in the rah target."
+	      _suggest_nat_traversal
 	      return 1
 	    fi
 	  fi
@@ -1539,6 +1575,12 @@ cmd_doctor() {
     fi
   fi
   _check_dep curl       curl           0 || true
+  printf '  %-12s ' tailscale
+  if command -v tailscale >/dev/null 2>&1; then
+    _tag_ok "ok"; printf '\n'
+  else
+    _tag_note "optional"; printf ' for a remote behind NAT — see "Remote behind NAT" in the README\n'
+  fi
   printf '  %-12s ' PATH
   case ":$PATH:" in
     *":$RAH_BIN_DIR:"*) _tag_ok "$RAH_BIN_DIR on PATH"; printf '\n' ;;

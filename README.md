@@ -60,6 +60,9 @@ For teams or labs that want to keep Claude Code / Codex sessions centralized on 
   then start the agent from the mounted directory.
 - [x] **macOS as the agent host.** Rah can run on macOS through macFUSE + SSHFS; the installer
   points to Homebrew, MacPorts, or manual install paths.
+- [x] **Remote behind NAT / no public IP.** Reach a remote that cannot accept inbound SSH by
+  giving it reachability one layer below rah (Tailscale or a reverse SSH tunnel) and using an
+  `~/.ssh/config` alias as the rah target. See [Remote Behind NAT](#remote-behind-nat-no-public-ip).
 - [ ] **Native Windows as the agent host.** Not supported yet; Windows users should prefer WSL2 or
   SSH into a Linux agent host.
 - [ ] **Native Windows as the remote host.** Only experimental when SSH/SFTP and a Unix-like
@@ -203,6 +206,63 @@ When verification passes, start Claude Code / Codex from this directory. Use the
 Restart the agent once after the first hook install. After that, new projects only need another
 `rah setup` or `rah mount`; the agent does not need to be configured again. To remove everything,
 run `rah uninstall`.
+
+## Remote Behind NAT (No Public IP)
+
+Rah needs an SSH destination it can reach: exec runs `ssh <host>`, files come over
+`sshfs <host>:<path>`. If the remote sits behind NAT/CGNAT with no public IP, it cannot
+accept inbound SSH and both planes fail. NAT traversal is solved one layer **below** rah:
+give the remote a reachable address, expose it as an `~/.ssh/config` alias, then point
+`rah setup` at that alias. Rah needs no special flags — `ssh` and `sshfs` inherit the
+alias's `HostName`, `Port`, `ProxyJump`, and `ProxyCommand`.
+
+### Option 1 — Tailscale (recommended)
+
+Works even when both ends are behind NAT (hole-punching with a DERP relay fallback); no
+public IP or VPS required.
+
+1. Install Tailscale on both machines and bring them onto the same tailnet:
+   ```bash
+   tailscale up        # run on the remote and on the agent machine
+   tailscale status    # find the remote's MagicDNS name, e.g. gpu-home.tailXXXX.ts.net
+   ```
+2. Add an alias to `~/.ssh/config` on the agent machine:
+   ```
+   Host gpu-home
+       HostName gpu-home.tailXXXX.ts.net
+       User you
+   ```
+3. Use the alias as the rah target:
+   ```bash
+   rah setup gpu-home:/home/you/project
+   ```
+
+### Option 2 — Reverse SSH tunnel (self-hosted)
+
+Use this if you prefer not to depend on a third-party overlay and have a public relay
+(a cheap VPS, or any always-on machine with a public IP).
+
+1. On the remote, keep a reverse tunnel up to the relay (supervise it with `autossh`, a
+   systemd unit, or `tmux`):
+   ```bash
+   autossh -M 0 -N -R 2222:localhost:22 you@relay.example.com
+   ```
+2. On the agent machine, reach the remote through the relay-forwarded port:
+   ```
+   Host gpu-home
+       HostName localhost
+       Port 2222
+       ProxyJump you@relay.example.com
+       User you
+   ```
+3. Use the alias as the rah target:
+   ```bash
+   rah setup gpu-home:/home/you/project
+   ```
+
+Port and proxy settings live in `~/.ssh/config`; rah only uses the alias, and both the
+command-execution and the sshfs mount inherit it. If `rah setup`/`rah mount` reports an
+SSH preflight failure, rah prints these same options as a hint.
 
 ## Commands
 

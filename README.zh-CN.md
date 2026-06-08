@@ -42,6 +42,7 @@ Rah 让 Claude Code / Codex 像在远端机器上一样开发项目，但账号�
 - [x] **推荐模式：Linux 共享 agent host。** 在一台 Linux 主机 B 上安装 Claude Code / Codex 和 `rah`，其它电脑 A1/A2/A3... 通过 SSH 登录 B；B 再把各自的远端工作目录 Cj 挂载到个人工作目录中使用。远端 Cj 可以是 Linux/macOS，或提供 SSH/SFTP 与类 Unix shell 环境的 Windows/WSL2。
 - [x] **个人模式：本机 Linux/macOS agent host + 远程 Linux 开发机。** 在自己的 Linux 或 macOS 办公机上安装 Claude Code / Codex 和 `rah`，把远程 Linux workstation/GPU 服务器的工作目录挂载到本机，然后从挂载目录启动 agent。
 - [x] **macOS 作为 agent host。** macOS 可通过 macFUSE + SSHFS 使用 Rah；安装器会提示 Homebrew、MacPorts 或手动安装路径。
+- [x] **远端在 NAT 后 / 无公网 IP。** 远端收不到入站 SSH 时，在 rah 下面一层给它可达性（Tailscale 或反向 SSH 隧道），然后用 `~/.ssh/config` 别名作为 rah 目标即可。见 [远端在 NAT 后](#远端在-nat-后无公网-ip)。
 - [ ] **原生 Windows 作为 agent host。** 暂不支持；Windows 用户优先使用 WSL2，或 SSH 到一台 Linux agent host。
 - [ ] **原生 Windows 作为 remote host。** 仅在具备 SSH/SFTP 和类 Unix shell/base64 环境时可尝试；普通 Windows 原生命令环境不是当前稳定目标。
 
@@ -165,6 +166,58 @@ rah verify
 - shell 命令实际在远端执行
 
 第一次安装 hook 后需要重启一次 agent。之后新增项目只需要再次运行 `rah setup` 或 `rah mount`，不需要重新配置 agent。完全移除可运行 `rah uninstall`。
+
+## 远端在 NAT 后（无公网 IP）
+
+Rah 需要一个能连上的 SSH 目的地：执行走 `ssh <host>`，文件走 `sshfs <host>:<path>`。如果远端在
+NAT/CGNAT 后面、没有公网 IP，它收不到入站 SSH，两条平面都会失败。NAT 穿透应当在 rah **下面一层**
+解决:先给远端一个可达地址,把它写成 `~/.ssh/config` 的别名,然后让 `rah setup` 指向这个别名即可。
+rah 不需要任何额外参数——`ssh` 和 `sshfs` 都会继承别名里的 `HostName`、`Port`、`ProxyJump`、
+`ProxyCommand`。
+
+### 方案一 —— Tailscale（推荐）
+
+即使两端都在 NAT 后也能用(打洞 + DERP 中继兜底),不需要公网 IP 或 VPS。
+
+1. 在两台机器上安装 Tailscale,接入同一个 tailnet:
+   ```bash
+   tailscale up        # 在远端和 agent 机器上都执行
+   tailscale status    # 找到远端的 MagicDNS 名,例如 gpu-home.tailXXXX.ts.net
+   ```
+2. 在 agent 机器的 `~/.ssh/config` 里加一个别名:
+   ```
+   Host gpu-home
+       HostName gpu-home.tailXXXX.ts.net
+       User you
+   ```
+3. 用别名作为 rah 目标:
+   ```bash
+   rah setup gpu-home:/home/you/project
+   ```
+
+### 方案二 —— 反向 SSH 隧道（自托管）
+
+如果你不想依赖第三方叠加网,并且有一台公网中继机(便宜的 VPS,或任意有公网 IP 的常开机器),用这个。
+
+1. 在远端常驻一条到中继机的反向隧道(用 `autossh`、systemd 单元或 `tmux` 守护):
+   ```bash
+   autossh -M 0 -N -R 2222:localhost:22 you@relay.example.com
+   ```
+2. 在 agent 机器上,经中继机转发的端口连到远端:
+   ```
+   Host gpu-home
+       HostName localhost
+       Port 2222
+       ProxyJump you@relay.example.com
+       User you
+   ```
+3. 用别名作为 rah 目标:
+   ```bash
+   rah setup gpu-home:/home/you/project
+   ```
+
+端口和代理设置都写在 `~/.ssh/config` 里;rah 只用别名,执行面和 sshfs 挂载都会继承它。如果
+`rah setup`/`rah mount` 报 SSH 预检失败,rah 会把上面这两种方案作为提示打印出来。
 
 ## 命令
 
