@@ -14,6 +14,8 @@
 
 Rah 让 Claude Code / Codex 像在远端机器上一样开发项目，但账号只登录在你指定的一台电脑上。
 
+**对 agent 无感。** Claude Code / Codex 看到的是本地目录和普通 shell：`cat`、`pytest`、`python train.py`、`nvidia-smi` 都照常运行。Rah 在工具层自动完成文件挂载和命令转发，让文件来自远端、命令也在远端执行，不占 prompt，不靠模型记住“要 SSH 到远端”。
+
 ## 使用场景
 
 ### 1. 个人电脑接入远程开发主机

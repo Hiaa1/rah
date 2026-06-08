@@ -15,6 +15,11 @@
 Rah lets Claude Code / Codex develop as if it were on a remote machine, while the agent account
 stays logged in on one machine you choose.
 
+**Invisible to the agent.** Claude Code / Codex sees a local folder and a normal shell: `cat`,
+`pytest`, `python train.py`, and `nvidia-smi` work as usual. Rah handles the file mount and command
+routing at the tool layer, so files come from the remote and commands execute there without prompt
+overhead or relying on the model to remember SSH.
+
 ## Usage Scenarios
 
 ### 1. Personal Computer To Remote Workstation
