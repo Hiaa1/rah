@@ -12,6 +12,8 @@
 
 [English](README.md)
 
+你是否需要在讨厌的集群服务器上面开发项目？你是否需要和他人共享coding plan？你是否有多台执行命令的服务器但是又不想都配上你的coding agent？如果是的话，这就是你需要的工具 - Rah。
+
 Rah 让 Claude Code / Codex 像在远端机器上一样开发项目，但账号只登录在你指定的一台电脑上。
 
 **对 agent 无感。** Claude Code / Codex 看到的是本地目录和普通 shell：`cat`、`pytest`、`python train.py`、`nvidia-smi` 都照常运行。Rah 在工具层自动完成文件挂载和命令转发，让文件来自远端、命令也在远端执行，不占 prompt，不靠模型记住“要 SSH 到远端”。
