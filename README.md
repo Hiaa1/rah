@@ -12,6 +12,8 @@
 
 [简体中文](README.zh-CN.md)
 
+Do you need to develop your code on stupid cluster sever? Do you want to share your coding plan with others? Do you want to develop on different servers but don't want to configure coding agent for every server and have risk of leaking your account? THIS is what you want - Rah!
+
 Rah lets Claude Code / Codex develop as if it were on a remote machine, while the agent account
 stays logged in on one machine you choose.
 
