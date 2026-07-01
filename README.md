@@ -273,11 +273,12 @@ SSH preflight failure, rah prints these same options as a hint.
 | `rah setup [--port PORT] [user@host:/path] [local-path] [-y]` | guided onboarding: deps, ssh key, agent hooks, mount |
 | `rah mount [--name N] [--port PORT] [--prelude CMD] user@host:/path [local-path]` | mount a remote code tree locally; defaults to `~/mnt_rah/<project>` |
 | `rah mount --same-path user@host:/abs/path` | opt into identical local/remote path mode |
-| `rah remount [name\|path]` | recover a dead/stale mount (all if no target) |
+| `rah remount [--force] [name\|path]` | recover dead/stale/unmounted mounts; all if no target; healthy mounts are skipped unless forced |
 | `rah unmount <name\|path>` | unmount + drop the ssh master, keep config |
 | `rah remove [--keep-local] [name\|path]` | unmount, remove rah config, rmdir empty mountpoint; current mount if omitted |
+| `rah autostart on\|off\|status` | restore managed mounts after reboot/login with a user-level service |
 | `rah init <claude\|codex> [--remove]` | install/remove the hook + skill for an agent |
-| `rah status` / `rah list` | mount / ssh / exec / agent-hook health |
+| `rah status [--all\|--current] [name\|path]` / `rah list` | global mount / ssh / exec / autostart / agent-hook health |
 | `rah verify [name\|path]` | end-to-end mount/ssh/hook check |
 | `rah doctor` | check dependencies, PATH, mount health |
 | `rah self-update` | update to the latest version |
@@ -287,8 +288,9 @@ SSH preflight failure, rah prints these same options as a hint.
 
 ## Mount management
 
-Use `rah status` or `rah list` to see every managed mount, including its name, remote path,
-local path, mount health, ssh reachability, and exec-plane health.
+Use `rah status` or `rah list` to see every managed mount from `~/.config/rah`, including its
+name, remote path, local path, mount health, ssh reachability, and exec-plane health. Use
+`rah status --current` when you only want the mount that contains the current directory.
 
 - `rah unmount <name|path>` disconnects the mount but keeps the config, so `rah remount <name|path>` can recover it later.
 - `rah remove [name|path]` disconnects it, removes the rah config, and removes the local mountpoint only if the directory is empty.
@@ -319,6 +321,8 @@ then report `Transport endpoint is not connected` or hang. Because exec and file
 channels, **command execution keeps working** while the mount is down. To recover the file plane:
 
 - `rah remount` re-establishes ssh + sshfs (idempotent; runs locally even mid-session).
+- `rah autostart on` installs a per-user boot/login job to run safe `rah remount` retries
+  automatically after reboot. Linux uses `systemd --user`; macOS uses a LaunchAgent.
 - The hook also **self-heals**: while you're working it probes the mount (throttled, non-blocking)
   and fires a background `rah remount` if it finds it dead — so it usually recovers on its own.
 - `rah status` reports `mounted` / `DEAD` / `not mounted` (a real liveness probe, not a stale flag).

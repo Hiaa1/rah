@@ -228,11 +228,12 @@ rah 不需要任何额外参数——`ssh` 和 `sshfs` 都会继承别名里的 
 | `rah setup [--port PORT] [user@host:/path] [local-path] [-y]` | 引导式初始化：依赖、ssh key、agent hook、挂载 |
 | `rah mount [--name N] [--port PORT] [--prelude CMD] user@host:/path [local-path]` | 把远端代码树挂到本地，默认 `~/mnt_rah/<project>` |
 | `rah mount --same-path user@host:/abs/path` | 显式使用本地/远端完全同路径模式 |
-| `rah remount [name\|path]` | 恢复失效或 stale mount，不传目标则恢复全部 |
+| `rah remount [--force] [name\|path]` | 恢复 dead/stale/未挂载的 mount；不传目标则检查全部；健康 mount 默认跳过，除非加 `--force` |
 | `rah unmount <name\|path>` | 卸载并关闭 ssh master 连接，保留配置 |
 | `rah remove [--keep-local] [name\|path]` | 卸载、删除 rah 配置，并删除空的 mountpoint 目录；不传目标则使用当前 mount |
+| `rah autostart on\|off\|status` | 用用户级服务在重启/登录后自动恢复受管理 mount |
 | `rah init <claude\|codex> [--remove]` | 安装或移除 agent hook 和 skill |
-| `rah status` / `rah list` | 查看 mount / ssh / exec / agent hook 状态 |
+| `rah status [--all\|--current] [name\|path]` / `rah list` | 查看全局 mount / ssh / exec / autostart / agent hook 状态 |
 | `rah verify [name\|path]` | 端到端检查 mount、ssh、hook |
 | `rah doctor` | 检查依赖、PATH、mount 健康状态 |
 | `rah self-update` | 更新到最新版本 |
@@ -242,7 +243,7 @@ rah 不需要任何额外参数——`ssh` 和 `sshfs` 都会继承别名里的 
 
 ## Mount 管理
 
-用 `rah status` 或 `rah list` 查看所有受管理 mount，包括名称、远端路径、本地路径、mount 健康状态、ssh 连通性和执行面健康状态。
+用 `rah status` 或 `rah list` 查看 `~/.config/rah` 里的所有受管理 mount，包括名称、远端路径、本地路径、mount 健康状态、ssh 连通性和执行面健康状态。只想看当前目录所在 mount 时，用 `rah status --current`。
 
 - `rah unmount <name|path>` 只断开 mount，保留配置，之后可以用 `rah remount <name|path>` 恢复。
 - `rah remove [name|path]` 会断开 mount、删除 rah 配置，并且只在本地 mountpoint 为空时删除这个目录。
@@ -266,6 +267,7 @@ hook 按工作目录自门控：不在 rah 管理的 mount 内时，命令原样
 网络中断、远端重启或本机睡眠都可能让 sshfs mount 变成 **dead**。此时文件工具可能报 `Transport endpoint is not connected` 或卡住。因为执行面和文件面是分开的，**命令执行仍会继续工作**。恢复文件面：
 
 - `rah remount` 会重新建立 ssh 和 sshfs，幂等，可在会话中途运行。
+- `rah autostart on` 会安装用户级启动/登录任务，在重启后自动、安全地重试 `rah remount`。Linux 使用 `systemd --user`，macOS 使用 LaunchAgent。
 - hook 也会 **自愈**：工作时会节流探测 mount；如果发现 mount 已死，会后台触发 `rah remount`，通常能自动恢复。
 - `rah status` 会报告 `mounted` / `DEAD` / `not mounted`，使用真实 liveness probe，而不是 stale 标记。
 

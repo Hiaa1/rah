@@ -5,7 +5,7 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.3.0"
+RAH_VERSION="0.4.0"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
@@ -78,6 +78,11 @@ _tag_note() { printf '%b' "${RAH_DIM}[$*]${RAH_RESET}"; }
 _die() { printf '%b\n' "${RAH_RED}rah: error:${RAH_RESET} $*" >&2; exit 1; }
 
 _lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+_trim_leading_ws() {
+  local s="$1"
+  printf '%s' "${s#"${s%%[![:space:]]*}"}"
+}
 
 _timeout() {
   local seconds="$1"; shift
@@ -263,6 +268,14 @@ _install_missing_deps() {
 
 # POSIX single-quote escaping for safe embedding in a remote shell string.
 _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+_unit_quote() {
+  printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+_xml_escape() {
+  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+}
 
 # Read one key from an env-style config file (no sourcing -> no code execution).
 _get() { sed -n "s/^$2=//p" "$1" | head -n1; }
@@ -480,6 +493,37 @@ _translate_command_paths() {
   printf '%s' "$cmd"
 }
 
+_is_env_assignment_word() {
+  case "$1" in
+    [A-Za-z_]*=*) return 0 ;;
+    *)            return 1 ;;
+  esac
+}
+
+# True when a tool command is invoking rah itself. Control-plane rah commands must
+# stay local even when the agent cwd is inside a managed mount.
+_is_rah_control_command() {
+  local s word
+  s="$(_trim_leading_ws "$1")"
+  while [ -n "$s" ]; do
+    word="${s%%[[:space:]]*}"
+    if [ "$word" = "$s" ]; then
+      s=""
+    else
+      s="$(_trim_leading_ws "${s#"$word"}")"
+    fi
+    case "$word" in
+      env|command) continue ;;
+      rah|*/rah|./rah) return 0 ;;
+    esac
+    if _is_env_assignment_word "$word"; then
+      continue
+    fi
+    return 1
+  done
+  return 1
+}
+
 # Fast, timeout-guarded liveness probe. A dead fuse mount hangs on access, so this
 # must never run unguarded. Returns 0 if the path is reachable.
 _mount_alive() { _timeout 2 stat "$1" >/dev/null 2>&1; }
@@ -666,13 +710,17 @@ Execution routing is automatic; never wrap commands in ssh manually.
   local mount directory; then checks dependencies, wires the installed agents, and mounts.
 - `rah setup [--port PORT] user@host:/path [local-path]` — scriptable form of the same flow.
   `~/path` is accepted for the remote path.
-- `rah status` / `rah list` — list managed mounts; show mounted / DEAD / not-mounted and ssh-master health.
+- `rah status` / `rah list` — global status for all managed mounts by default; use
+  `rah status --current` to show only the mount for the current directory.
 - `rah mount [--name N] [--port PORT] [--prelude 'CMD'] user@host:/path [local-path]` — mount a remote
   code tree at a local directory. If no local path is given, rah uses
   `~/mnt_rah/<project>`. Use `.` for the current directory, or `--same-path` when
   you intentionally want identical-path mode. `--prelude` is a shell snippet run before
   each remote command (e.g. `source .venv/bin/activate`) to fix the remote environment.
-- `rah remount [name|path]` — recover a dead/stale mount (re-establishes ssh + sshfs). No target = all.
+- `rah remount [name|path]` — recover a dead/stale/unmounted mount (re-establishes ssh + sshfs).
+  No target = all. Healthy mounts are left alone; use `--force` to rebuild them.
+- `rah autostart on|off|status` — install or inspect a user-level boot/login remount job
+  (systemd --user on Linux, launchd on macOS).
 - `rah unmount <name|path>` — unmount and drop the ssh master connection, keeping the config.
 - `rah remove [--keep-local] [name|path]` — unmount, remove rah config, and remove the empty mountpoint directory.
 - `rah init <claude|codex>` — install the routing hook and this skill for an agent.
@@ -682,6 +730,8 @@ Execution routing is automatic; never wrap commands in ssh manually.
 If file tools fail with `Transport endpoint is not connected` or hang, the mount has died. Run
 `rah remount` (it executes locally) and retry. Command execution over ssh keeps working even
 while the mount is down, since it is a separate channel.
+
+Use `rah autostart on` after setup if mounts should be restored automatically after reboot/login.
 
 ## Remote behind NAT
 
@@ -847,32 +897,59 @@ cmd_mount() {
 }
 
 cmd_remount() {
-  local names=() cfg name host remote_path mp socket port arg
+  local names=() cfg name host remote_path mp socket port arg force=0 best_effort=0 state failed=0
   if [ $# -gt 0 ]; then
-    for arg in "$@"; do
-      if cfg="$(_cfg_from_arg_or_cwd "$arg" 2>/dev/null)"; then
-        names+=("$(basename "$cfg" .env)")
-      else
-        names+=("$arg")
-      fi
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f|--force) force=1; shift ;;
+        --best-effort) best_effort=1; shift ;;
+        --*) _die "usage: rah remount [--force] [name|path ...]" ;;
+        *)
+          arg="$1"; shift
+          if cfg="$(_cfg_from_arg_or_cwd "$arg" 2>/dev/null)"; then
+            names+=("$(basename "$cfg" .env)")
+          else
+            names+=("$arg")
+          fi ;;
+      esac
     done
-  else
+  fi
+  if [ "${#names[@]}" -eq 0 ]; then
     while IFS= read -r cfg; do [ -n "$cfg" ] && names+=("$(basename "$cfg" .env)"); done < <(_list_configs)
   fi
   [ "${#names[@]}" -gt 0 ] || _die "no managed mounts to remount"
   for name in "${names[@]}"; do
     cfg="$RAH_CONFIG_DIR/$name.env"
-    [ -f "$cfg" ] || { echo "rah: no such mount: $name" >&2; continue; }
+    [ -f "$cfg" ] || { echo "rah: no such mount: $name" >&2; failed=1; continue; }
     host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
     mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
-    _unmount_fuse "$mp" 2>/dev/null || true
+    state="$(_mount_state "$mp")"
+    if [ "$force" -eq 0 ] && [ "$state" = mounted ]; then
+      _say_ok "already mounted $name"
+      _say_note "local: $mp"
+      continue
+    fi
+    if [ "$state" = unmounted ]; then
+      local original_mp="$mp"
+      if ! mp="$(_prepare_mountpoint "$mp" 0)"; then
+        echo "rah: mountpoint not ready for $name: $original_mp" >&2
+        failed=1
+        continue
+      fi
+    fi
+    if [ "$force" -eq 1 ] || [ "$state" = dead ]; then
+      _unmount_fuse "$mp" 2>/dev/null || true
+    fi
     if _do_mount "$host" "$remote_path" "$mp" "$socket" "$port"; then
       _say_ok "remounted $name"
       _say_note "local: $mp"
     else
       echo "rah: remount failed for $name" >&2
+      failed=1
     fi
   done
+  [ "$best_effort" -eq 1 ] && return 0
+  return "$failed"
 }
 
 cmd_unmount() {
@@ -1010,17 +1087,21 @@ cmd_hook() {
     passthrough=1
     reason="no-managed-mount"
   fi
-  case "$cmd" in rah|"rah "*) passthrough=1; reason="rah-command" ;; esac
+  if _is_rah_control_command "$cmd"; then
+    passthrough=1
+    reason="rah-command"
+  fi
 
   # Opportunistic, throttled, non-blocking mount self-heal (file plane only).
-  # Runs at most once per 10s; if the mount is dead, fire a detached remount and
-  # continue — the command still routes over ssh, which is independent of the mount.
+  # Runs at most once per 10s; if the mount is dead or unmounted, fire a detached
+  # remount and continue — the command still routes over ssh, independent of files.
   if [ -n "$cfg" ]; then
-    local _name _stamp
+    local _name _stamp _mp
     _name="$(basename "$cfg" .env)"; _stamp="$RAH_CONFIG_DIR/.heal.$_name"
     if ! _file_recent "$_stamp" 10; then
       : > "$_stamp" 2>/dev/null || true
-      if ! _mount_alive "$(_get "$cfg" mountpoint)"; then
+      _mp="$(_get "$cfg" mountpoint)"
+      if [ "$(_mount_state "$_mp")" != mounted ]; then
         if command -v setsid >/dev/null 2>&1; then
           setsid "$(_self_path)" remount "$_name" </dev/null >/dev/null 2>&1 &
         else
@@ -1108,6 +1189,237 @@ cmd_hook_log() {
     *)
       _die "usage: rah hook-log on [path] | off | status | clear [path]"
       ;;
+  esac
+}
+
+# ---------- autostart ----------
+
+_autostart_interval() { printf '%s\n' "${RAH_AUTOSTART_INTERVAL:-300}"; }
+
+_systemd_user_dir() { printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+_systemd_service_path() { printf '%s/rah-remount.service\n' "$(_systemd_user_dir)"; }
+_systemd_timer_path() { printf '%s/rah-remount.timer\n' "$(_systemd_user_dir)"; }
+
+_launchd_label() { printf 'dev.rah.remount\n'; }
+_launchd_plist_path() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(_launchd_label)"; }
+
+_autostart_provider() {
+  if _is_macos; then
+    printf 'launchd\n'
+  elif command -v systemctl >/dev/null 2>&1; then
+    printf 'systemd\n'
+  else
+    printf 'unsupported\n'
+  fi
+}
+
+_write_systemd_autostart() {
+  local unit_dir service timer rah_bin interval
+  unit_dir="$(_systemd_user_dir)"
+  service="$(_systemd_service_path)"
+  timer="$(_systemd_timer_path)"
+  interval="$(_autostart_interval)"
+  _ensure_path
+  rah_bin="$RAH_BIN_DIR/rah"
+  mkdir -p "$unit_dir" "$RAH_CONFIG_DIR"
+  cat > "$service" <<EOF
+[Unit]
+Description=Rah remount managed sshfs mounts
+Documentation=https://github.com/$RAH_REPO
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$(_unit_quote "$rah_bin") remount --best-effort
+EOF
+  cat > "$timer" <<EOF
+[Unit]
+Description=Start Rah remount after the user manager starts and retry periodically
+
+[Timer]
+OnStartupSec=20s
+OnUnitActiveSec=${interval}s
+AccuracySec=30s
+Persistent=true
+Unit=rah-remount.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+_autostart_enable_systemd() {
+  _write_systemd_autostart
+  _say_ok "installed systemd user units"
+  _say_note "$(_systemd_service_path)"
+  _say_note "$(_systemd_timer_path)"
+  if systemctl --user daemon-reload >/dev/null 2>&1 &&
+     systemctl --user enable --now rah-remount.timer >/dev/null 2>&1; then
+    _say_ok "autostart enabled"
+    if command -v loginctl >/dev/null 2>&1 &&
+       [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" = no ]; then
+      _say_note "to remount before your first login after boot, run: sudo loginctl enable-linger $USER"
+    fi
+  else
+    _say_warn "systemd --user is not available or could not enable the timer"
+    _say_cmd "systemctl --user daemon-reload"
+    _say_cmd "systemctl --user enable --now rah-remount.timer"
+    return 1
+  fi
+}
+
+_autostart_disable_systemd() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now rah-remount.timer >/dev/null 2>&1 || true
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f "$(_systemd_service_path)" "$(_systemd_timer_path)"
+  _say_ok "autostart disabled"
+}
+
+_autostart_status_systemd() {
+  local service timer enabled active
+  service="$(_systemd_service_path)"
+  timer="$(_systemd_timer_path)"
+  printf '  %-10s systemd --user\n' "provider:"
+  if [ -f "$service" ] || [ -f "$timer" ]; then
+    printf '  %-10s ' "files:"
+    _tag_ok "installed"; printf '\n'
+  else
+    printf '  %-10s ' "files:"
+    _tag_note "not installed"; printf ' run: rah autostart on\n'
+  fi
+  if command -v systemctl >/dev/null 2>&1 &&
+     systemctl --user show-environment >/dev/null 2>&1; then
+    enabled="$(systemctl --user is-enabled rah-remount.timer 2>/dev/null || true)"
+    active="$(systemctl --user is-active rah-remount.timer 2>/dev/null || true)"
+    printf '  %-10s %s\n' "timer:" "${enabled:-unknown}/${active:-unknown}"
+  else
+    printf '  %-10s ' "timer:"
+    _tag_warn "unavailable"; printf ' systemd --user is not reachable\n'
+  fi
+}
+
+_write_launchd_autostart() {
+  local plist label rah_bin interval out_log err_log
+  plist="$(_launchd_plist_path)"
+  label="$(_launchd_label)"
+  interval="$(_autostart_interval)"
+  _ensure_path
+  rah_bin="$RAH_BIN_DIR/rah"
+  mkdir -p "$HOME/Library/LaunchAgents" "$RAH_CONFIG_DIR"
+  out_log="$RAH_CONFIG_DIR/autostart.out.log"
+  err_log="$RAH_CONFIG_DIR/autostart.err.log"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(_xml_escape "$label")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(_xml_escape "$rah_bin")</string>
+    <string>remount</string>
+    <string>--best-effort</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>$interval</integer>
+  <key>StandardOutPath</key>
+  <string>$(_xml_escape "$out_log")</string>
+  <key>StandardErrorPath</key>
+  <string>$(_xml_escape "$err_log")</string>
+</dict>
+</plist>
+EOF
+}
+
+_autostart_enable_launchd() {
+  local plist label domain service
+  _write_launchd_autostart
+  plist="$(_launchd_plist_path)"
+  label="$(_launchd_label)"
+  domain="gui/$(id -u)"
+  service="$domain/$label"
+  _say_ok "installed launchd agent"
+  _say_note "$plist"
+  if launchctl bootout "$service" >/dev/null 2>&1; then :; fi
+  if launchctl bootstrap "$domain" "$plist" >/dev/null 2>&1; then
+    launchctl enable "$service" >/dev/null 2>&1 || true
+    launchctl kickstart -k "$service" >/dev/null 2>&1 || true
+    _say_ok "autostart enabled"
+  elif launchctl load -w "$plist" >/dev/null 2>&1; then
+    _say_ok "autostart enabled"
+  else
+    _say_warn "launchd could not load the agent"
+    _say_cmd "launchctl bootstrap $domain $(_shq "$plist")"
+    return 1
+  fi
+}
+
+_autostart_disable_launchd() {
+  local plist label service
+  plist="$(_launchd_plist_path)"
+  label="$(_launchd_label)"
+  service="gui/$(id -u)/$label"
+  launchctl bootout "$service" >/dev/null 2>&1 || launchctl unload -w "$plist" >/dev/null 2>&1 || true
+  rm -f "$plist"
+  _say_ok "autostart disabled"
+}
+
+_autostart_status_launchd() {
+  local plist label service
+  plist="$(_launchd_plist_path)"
+  label="$(_launchd_label)"
+  service="gui/$(id -u)/$label"
+  printf '  %-10s launchd\n' "provider:"
+  if [ -f "$plist" ]; then
+    printf '  %-10s ' "plist:"
+    _tag_ok "installed"; printf ' %s\n' "$plist"
+  else
+    printf '  %-10s ' "plist:"
+    _tag_note "not installed"; printf ' run: rah autostart on\n'
+  fi
+  printf '  %-10s ' "agent:"
+  if launchctl print "$service" >/dev/null 2>&1; then
+    _tag_ok "loaded"; printf '\n'
+  else
+    _tag_warn "not loaded"; printf '\n'
+  fi
+}
+
+_autostart_print_status() {
+  case "$(_autostart_provider)" in
+    systemd) _autostart_status_systemd ;;
+    launchd) _autostart_status_launchd ;;
+    *)       printf '  %-10s ' "provider:"; _tag_warn "unsupported"; printf ' needs systemd --user or macOS launchd\n' ;;
+  esac
+}
+
+cmd_autostart() {
+  local action="${1:-status}"
+  [ $# -le 1 ] || _die "usage: rah autostart on|off|status"
+  case "$action" in
+    on|enable)
+      case "$(_autostart_provider)" in
+        systemd) _autostart_enable_systemd ;;
+        launchd) _autostart_enable_launchd ;;
+        *) _die "autostart needs systemd --user on Linux or launchd on macOS" ;;
+      esac ;;
+    off|disable)
+      case "$(_autostart_provider)" in
+        systemd) _autostart_disable_systemd ;;
+        launchd) _autostart_disable_launchd ;;
+        *) _say_warn "autostart unsupported on this platform" ;;
+      esac ;;
+    status)
+      _say_header "rah autostart"
+      _autostart_print_status ;;
+    *)
+      _die "usage: rah autostart on|off|status" ;;
   esac
 }
 
@@ -1418,10 +1730,51 @@ _exec_plane_ok() {
 }
 
 cmd_status() {
-  local any=0 cfg name host remote_path mp socket state mode port
+  local scope="all" target="" show_agents=1 configs=() any=0 cfg name host remote_path mp socket state mode port current_cfg="" mount_header=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -a|--all) scope="all"; shift ;;
+      -c|--current) scope="current"; shift ;;
+      --no-agents) show_agents=0; shift ;;
+      --*) _die "usage: rah status [--all|--current] [--no-agents] [name|path]" ;;
+      *)
+        [ -z "$target" ] || _die "usage: rah status [--all|--current] [--no-agents] [name|path]"
+        target="$1"; shift ;;
+    esac
+  done
+
   _say_header "rah status (v$RAH_VERSION)"
-  while IFS= read -r cfg; do
-    [ -n "$cfg" ] || continue
+
+  if cfg="$(_config_for_cwd "$PWD" 2>/dev/null)"; then
+    current_cfg="$cfg"
+  fi
+
+  if [ -n "$target" ]; then
+    if cfg="$(_cfg_from_arg_or_cwd "$target")"; then
+      configs+=("$cfg")
+    else
+      _die "no such mount: $target"
+    fi
+  elif [ "$scope" = current ]; then
+    if [ -n "$current_cfg" ]; then
+      configs+=("$current_cfg")
+    else
+      _say_warn "current directory is not inside a rah-managed mount"
+    fi
+  else
+    while IFS= read -r cfg; do [ -n "$cfg" ] && configs+=("$cfg"); done < <(_list_configs)
+  fi
+
+  if [ -n "$target" ]; then
+    mount_header="Mounts (selected)"
+  elif [ "$scope" = current ]; then
+    mount_header="Mounts (current cwd)"
+  else
+    mount_header="Mounts (all managed configs)"
+  fi
+  _say_header "$mount_header"
+  _say_note "config dir: $RAH_CONFIG_DIR"
+  for cfg in "${configs[@]}"; do
     any=1
     name="$(basename "$cfg" .env)"
     host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
@@ -1442,16 +1795,25 @@ cmd_status() {
     if _ssh_ok "$host" "$port"; then _tag_ok "reachable"; printf '\n'; else _tag_fail "FAILED"; printf ' run: ssh%s -o BatchMode=yes %s true\n' "${port:+ -p $port}" "$host"; fi
     printf '  exec:       '
     if _exec_plane_ok "$mp"; then _tag_ok "remote ok"; printf '\n'; else _tag_fail "FAILED"; printf ' run: rah verify %s\n' "$name"; fi
-  done < <(_list_configs)
-  [ "$any" -eq 1 ] || _say_warn "no managed mounts; run: rah mount user@host:~/project"
-  _say_header "Agents"
-  _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" || true
-  _agent_hook_status "codex" "$HOME/.codex/hooks.json" "rah hook --decision allow --passthrough empty" "Bash|command_execution" || true
-  printf '  %-10s ' "hook-log"
-  if _hook_log_path >/dev/null 2>&1; then
-    printf '%b\n' "$(_tag_ok "on") run: rah hook-log off"
-  else
-    printf '%b\n' "$(_tag_note "off")"
+    if [ "$cfg" = "$current_cfg" ]; then
+      printf '  current:    yes\n'
+    fi
+  done
+  [ "$any" -eq 1 ] || [ "$scope" = current ] || _say_warn "no managed mounts; run: rah mount user@host:~/project"
+
+  _say_header "Autostart"
+  _autostart_print_status || true
+
+  if [ "$show_agents" -eq 1 ]; then
+    _say_header "Agents"
+    _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" || true
+    _agent_hook_status "codex" "$HOME/.codex/hooks.json" "rah hook --decision allow --passthrough empty" "Bash|command_execution" || true
+    printf '  %-10s ' "hook-log"
+    if _hook_log_path >/dev/null 2>&1; then
+      printf '%b\n' "$(_tag_ok "on") run: rah hook-log off"
+    else
+      printf '%b\n' "$(_tag_note "off")"
+    fi
   fi
 }
 
@@ -1639,15 +2001,16 @@ rah — Remote as Host (v$RAH_VERSION)
   rah mount [--name N] [--port PORT] [--prelude CMD] user@host:/path [local-path]
                                                                mount remote code tree locally
   rah mount --same-path user@host:/abs/path                    use identical local/remote path mode
-  rah remount [name|path]                                    recover a dead mount (all if no target)
+  rah remount [--force] [name|path]                          recover dead/unmounted mounts (all if no target)
   rah unmount <name|path>                                    unmount + drop ssh master, keep config
   rah remove [--keep-local] [name|path]                      unmount + remove config; rmdir empty mountpoint
+  rah autostart on|off|status                                restore managed mounts after reboot/login
   rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
   rah hook [--decision defer|allow|ask] [--passthrough defer|empty]
                                                                 PreToolUse rewrite (reads JSON on stdin)
   rah hook-log on [path] | off | status | clear [path]       enable/inspect hook diagnostics
   rah init <claude|codex> [--remove]                         install/remove hook + skill for an agent
-  rah status | list                                          show mount / ssh / exec / agent-hook health
+  rah status [--all|--current] [name|path] | list            show mount / ssh / exec / agent-hook health
   rah verify [name|path]                                     end-to-end mount/ssh/hook check
   rah doctor                                                 check dependencies, PATH, mount health
   rah self-update                                            update rah to the latest version
@@ -1664,6 +2027,7 @@ main() {
     remount)     cmd_remount "$@" ;;
     unmount)     cmd_unmount "$@" ;;
     remove|rm)   cmd_remove "$@" ;;
+    autostart)   cmd_autostart "$@" ;;
     run)         cmd_run "$@" ;;
     hook)        cmd_hook "$@" ;;
     hook-log)    cmd_hook_log "$@" ;;
