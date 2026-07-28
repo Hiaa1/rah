@@ -276,7 +276,7 @@ SSH preflight failure, rah prints these same options as a hint.
 | `rah remount [--force] [name\|path]` | recover dead/stale/unmounted mounts; all if no target; healthy mounts are skipped unless forced |
 | `rah unmount <name\|path>` | unmount + drop the ssh master, keep config |
 | `rah remove [--keep-local] [name\|path]` | unmount, remove rah config, rmdir empty mountpoint; current mount if omitted |
-| `rah autostart on\|off\|status` | restore managed mounts after reboot/login with a user-level service |
+| `rah autostart on\|off\|status` | keep managed mounts available after reboot/login with user-level services |
 | `rah init <claude\|codex> [--remove]` | install/remove the hook + skill for an agent |
 | `rah status [--all\|--current] [name\|path]` / `rah list` | global mount / ssh / exec / autostart / agent-hook health |
 | `rah verify [name\|path]` | end-to-end mount/ssh/hook check |
@@ -321,8 +321,10 @@ then report `Transport endpoint is not connected` or hang. Because exec and file
 channels, **command execution keeps working** while the mount is down. To recover the file plane:
 
 - `rah remount` re-establishes ssh + sshfs (idempotent; runs locally even mid-session).
-- `rah autostart on` installs a per-user boot/login job to run safe `rah remount` retries
-  automatically after reboot. Linux uses `systemd --user`; macOS uses a LaunchAgent.
+- `rah autostart on` restores mounts automatically after reboot/login. On Linux it creates one
+  `systemd --user` service per mount, keeps SSHFS in the foreground, and restarts it on failure;
+  macOS uses a LaunchAgent to retry safe `rah remount` calls. Neither platform needs shell rc files
+  or `/etc/fstab`.
 - The hook also **self-heals**: while you're working it probes the mount (throttled, non-blocking)
   and fires a background `rah remount` if it finds it dead — so it usually recovers on its own.
 - `rah status` reports `mounted` / `DEAD` / `not mounted` (a real liveness probe, not a stale flag).

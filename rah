@@ -5,7 +5,7 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.4.0"
+RAH_VERSION="0.4.1"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
@@ -541,6 +541,18 @@ _mount_state() {
   fi
 }
 
+# Wait until the kernel reports a live FUSE mount.  sshfs normally backgrounds
+# itself after a successful mount, so its immediate exit status alone is not a
+# sufficient success signal.
+_wait_for_mount() {
+  local mp="$1" attempts="${2:-5}" i
+  for ((i = 0; i < attempts; i++)); do
+    [ "$(_mount_state "$mp")" = mounted ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # Passwordless ssh reachability probe (BatchMode: never blocks on a password prompt).
 _ssh_ok() {
   local host="$1" port="${2:-}" ssh_args=()
@@ -773,10 +785,12 @@ _remote_uname() {
 }
 
 # Mount remote_path at mp. Re-establishes master, clears a stale mount,
-# and skips work if already healthy. Returns sshfs's status.
+# and skips work if already healthy. When foreground is set, replace the
+# current process with sshfs so a service manager can own its lifecycle.
 _do_mount() {
-  local host="$1" remote_path="$2" mp="$3" socket="$4" port="${5:-}" sshfs_args=() opts remote_os sshfs_bin
+  local host="$1" remote_path="$2" mp="$3" socket="$4" port="${5:-}" foreground="${6:-0}" sshfs_args=() foreground_args=() opts remote_os sshfs_bin
   [ -n "$port" ] && sshfs_args=(-p "$port")
+  [ "$foreground" = 1 ] && foreground_args=(-f)
   sshfs_bin="$(_sshfs_bin)" || return 1
   _ensure_master "$host" "$socket" "$port" || return 1
   if _is_mountpoint "$mp"; then
@@ -789,8 +803,13 @@ _do_mount() {
   case "$remote_os" in
     Darwin) opts="$opts,sftp_server=/usr/libexec/sftp-server" ;;
   esac
-  "$sshfs_bin" "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
-    -o "$opts"
+  if [ "$foreground" = 1 ]; then
+    exec "$sshfs_bin" "${foreground_args[@]}" "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
+      -o "$opts"
+  else
+    "$sshfs_bin" "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
+      -o "$opts"
+  fi
 }
 
 # ---------- mount ----------
@@ -890,6 +909,9 @@ cmd_mount() {
     printf 'ssh_port=%s\n'       "$port"
     printf 'prelude=%s\n'        "$prelude"
   } > "$cfg"
+  if _systemd_autostart_configured; then
+    _systemd_enable_mount_service "$name" || _say_warn "could not enable automatic recovery for $name"
+  fi
   _say_ok "mounted $name"
   _say_note "remote: $host:$remote_path${port:+ port $port}"
   _say_note "local:  $mountpoint [$mode]"
@@ -929,6 +951,16 @@ cmd_remount() {
       _say_note "local: $mp"
       continue
     fi
+    if _systemd_mount_service_enabled "$name"; then
+      if _systemd_restart_mount_service "$name" && _wait_for_mount "$mp"; then
+        _say_ok "remounted $name"
+        _say_note "local: $mp"
+      else
+        echo "rah: remount failed for $name" >&2
+        failed=1
+      fi
+      continue
+    fi
     if [ "$state" = unmounted ]; then
       local original_mp="$mp"
       if ! mp="$(_prepare_mountpoint "$mp" 0)"; then
@@ -940,7 +972,7 @@ cmd_remount() {
     if [ "$force" -eq 1 ] || [ "$state" = dead ]; then
       _unmount_fuse "$mp" 2>/dev/null || true
     fi
-    if _do_mount "$host" "$remote_path" "$mp" "$socket" "$port"; then
+    if _do_mount "$host" "$remote_path" "$mp" "$socket" "$port" && _wait_for_mount "$mp"; then
       _say_ok "remounted $name"
       _say_note "local: $mp"
     else
@@ -962,6 +994,7 @@ cmd_unmount() {
   local mp host socket port ssh_args=()
   mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
   [ -n "$port" ] && ssh_args=(-p "$port")
+  _systemd_stop_mount_service "$name" || true
   if _is_mountpoint "$mp"; then
     _unmount_fuse "$mp" || _die "unmount failed for $mp"
   fi
@@ -988,6 +1021,8 @@ cmd_remove() {
   name="$(basename "$cfg" .env)"
   mp="$(_get "$cfg" mountpoint)"; host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
   [ -n "$port" ] && ssh_args=(-p "$port")
+  _systemd_disable_mount_service "$name" || true
+  _systemd_stop_mount_service "$name" || true
   if _is_mountpoint "$mp"; then
     _unmount_fuse "$mp" || _die "unmount failed for $mp"
     _say_ok "unmounted $name"
@@ -1197,8 +1232,103 @@ cmd_hook_log() {
 _autostart_interval() { printf '%s\n' "${RAH_AUTOSTART_INTERVAL:-300}"; }
 
 _systemd_user_dir() { printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
-_systemd_service_path() { printf '%s/rah-remount.service\n' "$(_systemd_user_dir)"; }
-_systemd_timer_path() { printf '%s/rah-remount.timer\n' "$(_systemd_user_dir)"; }
+_systemd_mount_template_path() { printf '%s/rah-mount@.service\n' "$(_systemd_user_dir)"; }
+_systemd_legacy_service_path() { printf '%s/rah-remount.service\n' "$(_systemd_user_dir)"; }
+_systemd_legacy_timer_path() { printf '%s/rah-remount.timer\n' "$(_systemd_user_dir)"; }
+
+_systemd_user_ready() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+_systemd_mount_unit_name() {
+  command -v systemd-escape >/dev/null 2>&1 || return 1
+  systemd-escape --template='rah-mount@.service' "$1"
+}
+
+_systemd_autostart_configured() {
+  _is_macos && return 1
+  [ -f "$(_systemd_mount_template_path)" ]
+}
+
+_systemd_mount_service_enabled() {
+  local unit state
+  _systemd_user_ready || return 1
+  unit="$(_systemd_mount_unit_name "$1")" || return 1
+  state="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+  case "$state" in enabled|enabled-runtime|linked|linked-runtime) return 0 ;; esac
+  return 1
+}
+
+_systemd_enable_mount_service() {
+  local unit
+  _systemd_user_ready || return 1
+  unit="$(_systemd_mount_unit_name "$1")" || return 1
+  systemctl --user enable --now "$unit"
+}
+
+_systemd_restart_mount_service() {
+  local unit
+  _systemd_user_ready || return 1
+  unit="$(_systemd_mount_unit_name "$1")" || return 1
+  systemctl --user restart "$unit"
+}
+
+_systemd_stop_mount_service() {
+  local unit
+  _is_macos && return 0
+  _systemd_user_ready || return 0
+  unit="$(_systemd_mount_unit_name "$1")" || return 0
+  systemctl --user stop "$unit" >/dev/null 2>&1 || true
+}
+
+_systemd_disable_mount_service() {
+  local unit
+  _is_macos && return 0
+  _systemd_user_ready || return 0
+  unit="$(_systemd_mount_unit_name "$1")" || return 0
+  systemctl --user disable "$unit" >/dev/null 2>&1 || true
+}
+
+# Commands used by the generated systemd template. Keep sshfs in the foreground
+# so systemd owns the FUSE process rather than killing its background child when
+# a oneshot remount command exits.
+cmd_systemd_mount() {
+  local name="${1:-}" cfg host remote_path mp socket port state
+  [ -n "$name" ] || _die "internal: missing systemd mount name"
+  cfg="$RAH_CONFIG_DIR/$name.env"
+  [ -f "$cfg" ] || return 0
+  host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
+  mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
+  state="$(_mount_state "$mp")"
+  [ "$state" = mounted ] && return 0
+  [ "$state" = dead ] && _unmount_fuse "$mp" 2>/dev/null || true
+  mp="$(_prepare_mountpoint "$mp" 0)" || return 1
+  _do_mount "$host" "$remote_path" "$mp" "$socket" "$port" 1
+}
+
+cmd_systemd_check() {
+  local name="${1:-}" cfg mp
+  [ -n "$name" ] || _die "internal: missing systemd mount name"
+  cfg="$RAH_CONFIG_DIR/$name.env"
+  [ -f "$cfg" ] || return 0
+  mp="$(_get "$cfg" mountpoint)"
+  _wait_for_mount "$mp" 10 || {
+    echo "rah: systemd mount did not become ready: $name ($mp)" >&2
+    return 1
+  }
+}
+
+cmd_systemd_unmount() {
+  local name="${1:-}" cfg mp state
+  [ -n "$name" ] || return 0
+  cfg="$RAH_CONFIG_DIR/$name.env"
+  [ -f "$cfg" ] || return 0
+  mp="$(_get "$cfg" mountpoint)"
+  state="$(_mount_state "$mp")"
+  case "$state" in
+    mounted|dead) _unmount_fuse "$mp" >/dev/null 2>&1 || true ;;
+  esac
+}
 
 _launchd_label() { printf 'dev.rah.remount\n'; }
 _launchd_plist_path() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(_launchd_label)"; }
@@ -1214,89 +1344,115 @@ _autostart_provider() {
 }
 
 _write_systemd_autostart() {
-  local unit_dir service timer rah_bin interval
+  local unit_dir template rah_bin
   unit_dir="$(_systemd_user_dir)"
-  service="$(_systemd_service_path)"
-  timer="$(_systemd_timer_path)"
-  interval="$(_autostart_interval)"
+  template="$(_systemd_mount_template_path)"
   _ensure_path
   rah_bin="$RAH_BIN_DIR/rah"
   mkdir -p "$unit_dir" "$RAH_CONFIG_DIR"
-  cat > "$service" <<EOF
+  cat > "$template" <<EOF
 [Unit]
-Description=Rah remount managed sshfs mounts
+Description=Keep RAH mount %I available
 Documentation=https://github.com/$RAH_REPO
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=$(_unit_quote "$rah_bin") remount --best-effort
-EOF
-  cat > "$timer" <<EOF
-[Unit]
-Description=Start Rah remount after the user manager starts and retry periodically
-
-[Timer]
-OnStartupSec=20s
-OnUnitActiveSec=${interval}s
-AccuracySec=30s
-Persistent=true
-Unit=rah-remount.service
+Type=simple
+Environment=PATH=$RAH_BIN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$(_unit_quote "$rah_bin") _systemd-mount %I
+ExecStartPost=$(_unit_quote "$rah_bin") _systemd-check %I
+ExecStop=$(_unit_quote "$rah_bin") _systemd-unmount %I
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
 
 [Install]
-WantedBy=timers.target
+WantedBy=default.target
 EOF
 }
 
+_disable_legacy_systemd_autostart() {
+  if _systemd_user_ready; then
+    systemctl --user disable --now rah-remount.timer >/dev/null 2>&1 || true
+    systemctl --user stop rah-remount.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$(_systemd_legacy_service_path)" "$(_systemd_legacy_timer_path)"
+}
+
 _autostart_enable_systemd() {
+  local cfg name enabled=0 failed=0
   _write_systemd_autostart
   _say_ok "installed systemd user units"
-  _say_note "$(_systemd_service_path)"
-  _say_note "$(_systemd_timer_path)"
-  if systemctl --user daemon-reload >/dev/null 2>&1 &&
-     systemctl --user enable --now rah-remount.timer >/dev/null 2>&1; then
-    _say_ok "autostart enabled"
+  _say_note "$(_systemd_mount_template_path)"
+  if systemctl --user daemon-reload >/dev/null 2>&1; then
+    _disable_legacy_systemd_autostart
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    while IFS= read -r cfg; do
+      [ -n "$cfg" ] || continue
+      name="$(basename "$cfg" .env)"
+      if _systemd_enable_mount_service "$name" >/dev/null 2>&1; then
+        enabled=$((enabled + 1))
+      else
+        _say_warn "could not enable automatic recovery for $name"
+        failed=1
+      fi
+    done < <(_list_configs)
+    if [ "$enabled" -gt 0 ]; then
+      _say_ok "automatic recovery enabled for $enabled mount(s)"
+    else
+      _say_warn "no managed mounts to enable yet; future rah mount commands will be added automatically"
+    fi
     if command -v loginctl >/dev/null 2>&1 &&
        [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" = no ]; then
       _say_note "to remount before your first login after boot, run: sudo loginctl enable-linger $USER"
     fi
+    return "$failed"
   else
     _say_warn "systemd --user is not available or could not enable the timer"
     _say_cmd "systemctl --user daemon-reload"
-    _say_cmd "systemctl --user enable --now rah-remount.timer"
+    _say_cmd "rah autostart on"
     return 1
   fi
 }
 
 _autostart_disable_systemd() {
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user disable --now rah-remount.timer >/dev/null 2>&1 || true
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
-  fi
-  rm -f "$(_systemd_service_path)" "$(_systemd_timer_path)"
+  local cfg name
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    name="$(basename "$cfg" .env)"
+    _systemd_disable_mount_service "$name"
+  done < <(_list_configs)
+  _disable_legacy_systemd_autostart
+  rm -f "$(_systemd_mount_template_path)"
+  _systemd_user_ready && systemctl --user daemon-reload >/dev/null 2>&1 || true
   _say_ok "autostart disabled"
 }
 
 _autostart_status_systemd() {
-  local service timer enabled active
-  service="$(_systemd_service_path)"
-  timer="$(_systemd_timer_path)"
+  local template cfg name unit enabled=0 active=0 total=0
+  template="$(_systemd_mount_template_path)"
   printf '  %-10s systemd --user\n' "provider:"
-  if [ -f "$service" ] || [ -f "$timer" ]; then
+  if [ -f "$template" ]; then
     printf '  %-10s ' "files:"
-    _tag_ok "installed"; printf '\n'
+    _tag_ok "installed"; printf ' %s\n' "$template"
   else
     printf '  %-10s ' "files:"
     _tag_note "not installed"; printf ' run: rah autostart on\n'
   fi
-  if command -v systemctl >/dev/null 2>&1 &&
-     systemctl --user show-environment >/dev/null 2>&1; then
-    enabled="$(systemctl --user is-enabled rah-remount.timer 2>/dev/null || true)"
-    active="$(systemctl --user is-active rah-remount.timer 2>/dev/null || true)"
-    printf '  %-10s %s\n' "timer:" "${enabled:-unknown}/${active:-unknown}"
+  if _systemd_user_ready; then
+    while IFS= read -r cfg; do
+      [ -n "$cfg" ] || continue
+      total=$((total + 1)); name="$(basename "$cfg" .env)"
+      unit="$(_systemd_mount_unit_name "$name" 2>/dev/null || true)"
+      [ -n "$unit" ] || continue
+      _systemd_mount_service_enabled "$name" && enabled=$((enabled + 1))
+      [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = active ] && active=$((active + 1))
+    done < <(_list_configs)
+    printf '  %-10s %s/%s enabled, %s active\n' "mounts:" "$enabled" "$total" "$active"
   else
-    printf '  %-10s ' "timer:"
+    printf '  %-10s ' "mounts:"
     _tag_warn "unavailable"; printf ' systemd --user is not reachable\n'
   fi
 }
@@ -2037,6 +2193,9 @@ main() {
     doctor)      cmd_doctor "$@" ;;
     self-update) cmd_self_update "$@" ;;
     uninstall)   cmd_uninstall "$@" ;;
+    _systemd-mount)   cmd_systemd_mount "$@" ;;
+    _systemd-check)   cmd_systemd_check "$@" ;;
+    _systemd-unmount) cmd_systemd_unmount "$@" ;;
     version|--version|-v) echo "rah $RAH_VERSION" ;;
     ""|-h|--help|help) _usage ;;
     *) _die "unknown subcommand: $sub (try: rah help)" ;;

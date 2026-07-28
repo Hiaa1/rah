@@ -231,7 +231,7 @@ rah 不需要任何额外参数——`ssh` 和 `sshfs` 都会继承别名里的 
 | `rah remount [--force] [name\|path]` | 恢复 dead/stale/未挂载的 mount；不传目标则检查全部；健康 mount 默认跳过，除非加 `--force` |
 | `rah unmount <name\|path>` | 卸载并关闭 ssh master 连接，保留配置 |
 | `rah remove [--keep-local] [name\|path]` | 卸载、删除 rah 配置，并删除空的 mountpoint 目录；不传目标则使用当前 mount |
-| `rah autostart on\|off\|status` | 用用户级服务在重启/登录后自动恢复受管理 mount |
+| `rah autostart on\|off\|status` | 用用户级服务在重启/登录后保持受管理 mount 可用 |
 | `rah init <claude\|codex> [--remove]` | 安装或移除 agent hook 和 skill |
 | `rah status [--all\|--current] [name\|path]` / `rah list` | 查看全局 mount / ssh / exec / autostart / agent hook 状态 |
 | `rah verify [name\|path]` | 端到端检查 mount、ssh、hook |
@@ -267,7 +267,9 @@ hook 按工作目录自门控：不在 rah 管理的 mount 内时，命令原样
 网络中断、远端重启或本机睡眠都可能让 sshfs mount 变成 **dead**。此时文件工具可能报 `Transport endpoint is not connected` 或卡住。因为执行面和文件面是分开的，**命令执行仍会继续工作**。恢复文件面：
 
 - `rah remount` 会重新建立 ssh 和 sshfs，幂等，可在会话中途运行。
-- `rah autostart on` 会安装用户级启动/登录任务，在重启后自动、安全地重试 `rah remount`。Linux 使用 `systemd --user`，macOS 使用 LaunchAgent。
+- `rah autostart on` 会在重启/登录后自动恢复 mount。Linux 为每个 mount 创建一个
+  `systemd --user` service，让 SSHFS 以前台方式运行，并在失败后自动重启；macOS 使用
+  LaunchAgent 安全地重试 `rah remount`。两种方式都不需要 shell rc 文件或 `/etc/fstab`。
 - hook 也会 **自愈**：工作时会节流探测 mount；如果发现 mount 已死，会后台触发 `rah remount`，通常能自动恢复。
 - `rah status` 会报告 `mounted` / `DEAD` / `not mounted`，使用真实 liveness probe，而不是 stale 标记。
 
