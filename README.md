@@ -13,6 +13,10 @@
 >
 > **让代码和算力留在远端，让 agent 留在你信任的机器上。**
 
+**One agent host. Many shared compute hosts.** Configure Claude Code or Codex once on your own machine, then use Rah to reach any number of SSH-accessible GPU servers, CPU boxes, lab workstations, or data machines. The shared servers stay agent-free: no repeated agent setup, no account login on every machine, and no Rah installation on the remote side.
+
+**一台 agent 主机，多台共享计算服务器。** 只在自己的电脑上配置一次 Claude Code 或 Codex，之后就可以通过 Rah 连接任意 SSH 服务器：GPU 服务器、CPU 机器、实验室工作站或数据主机。共享服务器无需安装 agent，不需要在每台机器上重复配置或登录账号，远端也不需要安装 Rah。
+
 Rah lets Claude Code and Codex work on a remote project as if it were a local folder. Files are mounted through SSHFS; normal shell commands are routed through SSH. Your editor, agent, datasets, GPU environment, and long-running jobs can each stay where they belong.
 
 Rah 让 Claude Code 和 Codex 像操作本地目录一样操作远端项目：文件通过 SSHFS 挂载，普通 shell 命令通过 SSH 转发。编辑器、agent、数据集、GPU 环境和长时间任务，都可以留在最合适的机器上。
@@ -31,21 +35,45 @@ Rah keeps the agent on the machine you choose, while making the remote project f
 
 Rah 把 agent 留在你指定的机器上，同时让远端项目拥有接近本地开发的体验。你不需要反复提醒模型使用 SSH，也不需要给每条命令加前缀，更不用为了跑一次测试就搬运大型数据集。
 
+The important distinction is that Rah turns shared servers into execution targets, not additional agent hosts. You keep one familiar agent environment and one trusted login session, while each server contributes the compute, data, or network access it already has.
+
+关键区别在于：Rah 把共享服务器变成执行目标，而不是更多的 agent 主机。你只维护一套熟悉的 agent 环境和一个可信的登录态，每台服务器只提供它原本就拥有的算力、数据或网络访问能力。
+
 ## Real-world scenarios / 具体应用场景
 
-### 1. Laptop + remote GPU workstation / 笔记本 + 远程 GPU 工作站
+### 1. One agent, many shared compute servers / 一台 agent，多台共享计算服务器
+
+This is the core Rah workflow. You have one personal laptop or workstation with Claude Code or Codex, but several shared machines: a GPU server for training, a CPU server for tests, a storage host with large datasets, and perhaps a lab workstation reachable only through an internal network. You do not want to install an agent on every shared machine, consume another login, modify a shared environment, or ask administrators to maintain another tool.
+
+这就是 Rah 最核心的使用方式：你有一台配置了 Claude Code 或 Codex 的个人电脑，但同时拥有多台共享机器——一台用于训练的 GPU 服务器、一台用于测试的 CPU 服务器、一台存放大型数据集的存储主机，以及一台只能通过内网访问的实验室工作站。你不希望在每台共享机器上安装 agent、重复登录、污染公共环境，也不希望让管理员额外维护一套工具。
+
+Install the agent and Rah once on your own host. Give each server a clear SSH alias, then mount whichever project you need:
+
+只在自己的主机上安装一次 agent 和 Rah，为每台服务器配置清晰的 SSH alias，然后按需挂载项目：
+
+```bash
+rah setup gpu-train:~/projects/model
+rah setup cpu-test:~/projects/model
+rah setup lab-workstation:~/projects/model
+```
+
+The agent configuration stays local and shared servers remain clean. Switch the working directory to switch compute; the same normal commands—`pytest`, `python train.py`, `nvidia-smi`, and dataset inspection—run on the selected remote host.
+
+agent 配置始终留在本地，所有共享服务器保持干净。切换工作目录就能切换算力；`pytest`、`python train.py`、`nvidia-smi` 和数据集检查等普通命令，都会在当前选中的远端主机执行。
+
+### 2. Laptop + remote GPU workstation / 笔记本 + 远程 GPU 工作站
 
 Keep Claude Code or Codex on your Mac or Linux laptop. Mount the project from a remote GPU box, ask the agent to edit code and run tests, and let `nvidia-smi`, training jobs, datasets, and model weights stay on the GPU box. Only the code tree is mounted; the heavy data never has to cross the network.
 
 把 Claude Code 或 Codex 留在你的 Mac/Linux 笔记本上，把远程 GPU 机器上的项目挂载进来。让 agent 修改代码、运行测试，`nvidia-smi`、训练任务、数据集和模型权重都在 GPU 机器上执行。Rah 只挂载代码树，大型数据不需要跨网络搬运。
 
-### 2. Home lab or office machine behind NAT / NAT 后的家庭实验室或办公主机
+### 3. Home lab or office machine behind NAT / NAT 后的家庭实验室或办公主机
 
 Your workstation does not need a public IP. Give it reachability with Tailscale or a reverse SSH tunnel, expose that route as an SSH config alias, and point Rah at the alias. The same alias is inherited by both the file and command planes.
 
 你的工作站不需要公网 IP。可以用 Tailscale 或反向 SSH 隧道提供可达性，再把连接写成 SSH config alias，最后让 Rah 使用这个 alias。文件挂载和命令执行会共同继承这套 SSH 配置。
 
-### 3. A trusted agent gateway for a team or lab / 团队或实验室的可信 agent 网关
+### 4. A trusted agent gateway for a team or lab / 团队或实验室的可信 agent 网关
 
 Run the agent on one trusted Linux host and let approved users reach that host through your existing access channel. Each user can mount their own remote project into an isolated working directory. The agent session stays centralized, while code, credentials, data, and compute remain on the correct remote host.
 
@@ -55,7 +83,7 @@ This is an operational pattern for trusted environments, not a way to bypass pro
 
 这是一种适用于可信环境的运维模式，不是绕过服务商政策或随意共享凭据的方法。和他人使用、或在不可信仓库中使用前，请先阅读安全说明。
 
-### 4. Multiple remote projects without multiple agent setups / 多个远程项目，一个 agent 环境
+### 5. Multiple remote projects without multiple agent setups / 多个远程项目，一个 agent 环境
 
 Mount several projects under one agent host, switch directories, and use `rah status`, `rah remount`, and optional autostart to keep the working set healthy across network drops, laptop sleep, and reboots.
 
@@ -152,6 +180,10 @@ If Rah is not automatically wired during setup, run one of these commands and re
 rah init claude
 rah init codex
 ```
+
+Once the hook is installed, adding another shared server does not require another agent setup or another agent login. Configure the SSH alias and run `rah setup` for the new project; the same local Claude Code or Codex session can use it immediately.
+
+hook 安装好之后，新增共享服务器不需要重新配置 agent，也不需要再次登录 agent。只需配置 SSH alias，再为新项目运行 `rah setup`；同一个本地 Claude Code 或 Codex 会话即可直接使用它。
 
 ## Supported environments / 支持的环境
 
