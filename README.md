@@ -1,386 +1,357 @@
 # Remote as Host (rah)
 
 <p align="center">
-  <img src="assets/rah-logo.svg" alt="Rah logo - local agent with files mounted from a remote host and commands routed to it" width="720">
+  <img src="assets/rah-logo.svg" alt="Rah logo - a local coding agent connected to a remote host through file and command lanes" width="720">
 </p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue)](rah)
-[![Views](https://hits.sh/github.com/Hiaa1/rah.svg?label=views&color=0e75b6)](https://hits.sh/github.com/Hiaa1/rah/)
-[![Claude Code](https://img.shields.io/badge/Claude_Code-compatible-7C3AED)](README.md#agent-support)
-[![Codex CLI](https://img.shields.io/badge/Codex_CLI-compatible-111827)](README.md#agent-support)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](rah)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-compatible-7C3AED)](#agent-support--agent-支持)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-compatible-111827)](#agent-support--agent-支持)
 
-[简体中文](README.zh-CN.md)
+> **Develop where the compute lives. Keep your agent where you trust it.**
+>
+> **让代码和算力留在远端，让 agent 留在你信任的机器上。**
 
-Do you need to develop your code on stupid cluster sever? Do you want to share your coding plan with others? Do you want to develop on different servers but don't want to configure coding agent for every server and have risk of leaking your account?                 **THIS** is what you want - **Rah**!
+Rah lets Claude Code and Codex work on a remote project as if it were a local folder. Files are mounted through SSHFS; normal shell commands are routed through SSH. Your editor, agent, datasets, GPU environment, and long-running jobs can each stay where they belong.
 
-Rah lets Claude Code / Codex develop as if it were on a remote machine, while the agent account
-stays logged in on one machine you choose.
-
-**Invisible to the agent.** Claude Code / Codex sees a local folder and a normal shell: `cat`,
-`pytest`, `python train.py`, and `nvidia-smi` work as usual. Rah handles the file mount and command
-routing at the tool layer, so files come from the remote and commands execute there without prompt
-overhead or relying on the model to remember SSH.
-
-## Usage Scenarios
-
-### 1. Personal Computer To Remote Workstation
-
-For users who want to use a personal Mac/Ubuntu machine while doing the real work on a remote
-workstation, server, or lab machine.
-
-- **Machine A**: your local Mac/Ubuntu/WSL2/Linux gateway. It runs Claude Code / Codex and installs
-  `rah`.
-- **Machine B**: the remote development host. It stores the code, datasets, model weights, and GPU
-  environment, and only needs SSH enabled.
-- On machine A, use `rah` to mount machine B's project, for example under `~/mnt_rah/<project>`.
-- On machine A, enter that mounted directory and start Claude Code / Codex. The agent reads and
-  writes B's files, and commands execute on B.
-
-### 2. Shared Agent Host For Multiple Users
-
-For teams or labs that want to keep Claude Code / Codex sessions centralized on one trusted host.
-
-- **A1, A2, A3...**: each person's own computer. It only needs SSH access to the shared agent host.
-- **Machine B**: the shared agent host. It installs Claude Code / Codex and `rah`, and acts as the
-  common development entry point.
-- **C1, C2, C3...**: each person's own code host, workstation, or server, storing their project,
-  data, and environment.
-- Each user SSHes from their own computer to B, then uses `rah` to mount their Cj project into a
-  personal working directory on B.
-- Each user starts Claude Code / Codex from their own directory on B. Files come from their own Cj,
-  and commands execute on their own Cj.
-
-## Supported Now / TODO
-
-- [x] **Recommended mode: shared Linux agent host.** Install Claude Code / Codex and `rah` on one
-  Linux machine B. Other computers A1/A2/A3... SSH into B; B mounts each user's remote workspace Cj
-  into a personal working directory. Cj can be Linux/macOS, or Windows/WSL2 if it provides
-  SSH/SFTP plus a Unix-like shell environment.
-- [x] **Personal mode: Linux/macOS agent host + remote Linux dev box.** Install Claude Code / Codex
-  and `rah` on your own Linux or macOS work machine, mount the remote Linux workstation/GPU server,
-  then start the agent from the mounted directory.
-- [x] **macOS as the agent host.** Rah can run on macOS through macFUSE + SSHFS; the installer
-  points to Homebrew, MacPorts, or manual install paths.
-- [x] **Remote behind NAT / no public IP.** Reach a remote that cannot accept inbound SSH by
-  giving it reachability one layer below rah (Tailscale or a reverse SSH tunnel) and using an
-  `~/.ssh/config` alias as the rah target. See [Remote Behind NAT](#remote-behind-nat-no-public-ip).
-- [ ] **Native Windows as the agent host.** Not supported yet; Windows users should prefer WSL2 or
-  SSH into a Linux agent host.
-- [ ] **Native Windows as the remote host.** Only experimental when SSH/SFTP and a Unix-like
-  shell/base64 environment are available; a normal Windows shell is not a stable target today.
-
-Use Rah if you want to:
-
-- avoid spreading Claude Code / Codex sessions across multiple computers, networks, or VPN exits
-- control a remote workstation, server, or lab machine from your local agent
-- avoid copying datasets or using git as a development sync mechanism
-
-Rah does two things:
-
-- Mounts the remote project as a local folder, for example `~/mnt_rah/<project>`, so you can edit
-  remote code like local files.
-- Automatically sends the agent's shell commands to the remote machine, so tests, training jobs,
-  GPU calls, and dataset access run where the project really lives.
-
-The routing is handled by hooks, not by prompt reminders, so the agent does not need to know it is
-doing remote development. **Zero remote install:** install `rah` only on the agent machine; the
-remote only needs SSH and basic shell tools.
-
-## Machine Roles
-
-- **agent host**: the machine that runs Claude Code / Codex and `rah`.
-- **remote host**: the machine that stores the project, data, environment, and GPU, and actually
-  runs commands.
-
-**Install Rah on the agent host, not on the remote host.**
-
-The supported agent host target today is a Unix-like environment with sshfs/FUSE, `ssh`, and
-standard shell tools: Ubuntu, Debian, WSL2, and macOS. Native Windows as the agent host is outside
-the current scope; Windows users should prefer WSL2.
-
-The remote host does not need `rah`. It only needs SSH access and a project directory. A Linux
-server/workstation, or an SSH-enabled macOS machine, can be a remote target.
-
-## Trusted agent gateway
-
-If you pay for a Claude Code or Codex plan and want to use it from multiple computers, frequently
-logging the same account in from different devices, networks, or VPN exits can increase account
-risk, including security review or lockout. Rah's recommended pattern is to keep the agent account
-on one trusted agent host. Other computers reach that host through your own remote-access channel,
-and Rah controls the real remote host from there. The account session stays in one place, while
-project files and command execution still happen on the right remote machine.
+Rah 让 Claude Code 和 Codex 像操作本地目录一样操作远端项目：文件通过 SSHFS 挂载，普通 shell 命令通过 SSH 转发。编辑器、agent、数据集、GPU 环境和长时间任务，都可以留在最合适的机器上。
 
 <p align="center">
-  <img src="assets/rah-seamless-dev.png" alt="Rah makes local coding agents work normally while hooks route commands to a remote host" width="900">
+  <img src="assets/rah-seamless-dev.png" alt="Rah routes local coding agent commands and files to a remote development host" width="900">
 </p>
 
-## Install And Use
+## The problem Rah solves / Rah 解决的问题
 
-### Check Your Environment
+Your laptop may be the best place to run an agent: it has your login session, your editor, and the workflow you already trust. But the real project may live on a GPU server, a lab workstation, a cluster login node, or a machine behind a private network. Copying repositories, datasets, virtual environments, and outputs back and forth quickly becomes the work.
 
-- Install `rah` on the machine that runs Claude Code / Codex. Ubuntu, Debian, WSL2, macOS, or a
-  Linux gateway are the recommended environments today.
-- The remote machine only needs SSH enabled and a project directory. It does not need `rah`.
-- If your remote SSH uses a non-default port, pass `--port` during setup.
+你的笔记本可能最适合运行 agent：登录态、编辑器和工作流都已经准备好了。但真正的项目往往在 GPU 服务器、实验室工作站、集群登录节点，或者一台藏在私网后的机器上。反复同步代码、数据集、虚拟环境和输出文件，很快就会变成新的负担。
 
-### Pick One Install Option
+Rah keeps the agent on the machine you choose, while making the remote project feel local. You do not need to teach the model to remember SSH, prefix every command, or copy large data just to run a test.
 
-Choose one of the two options below. You do not need to run both.
+Rah 把 agent 留在你指定的机器上，同时让远端项目拥有接近本地开发的体验。你不需要反复提醒模型使用 SSH，也不需要给每条命令加前缀，更不用为了跑一次测试就搬运大型数据集。
 
-**Option 1: one-line terminal install (recommended)**
+## Real-world scenarios / 具体应用场景
+
+### 1. Laptop + remote GPU workstation / 笔记本 + 远程 GPU 工作站
+
+Keep Claude Code or Codex on your Mac or Linux laptop. Mount the project from a remote GPU box, ask the agent to edit code and run tests, and let `nvidia-smi`, training jobs, datasets, and model weights stay on the GPU box. Only the code tree is mounted; the heavy data never has to cross the network.
+
+把 Claude Code 或 Codex 留在你的 Mac/Linux 笔记本上，把远程 GPU 机器上的项目挂载进来。让 agent 修改代码、运行测试，`nvidia-smi`、训练任务、数据集和模型权重都在 GPU 机器上执行。Rah 只挂载代码树，大型数据不需要跨网络搬运。
+
+### 2. Home lab or office machine behind NAT / NAT 后的家庭实验室或办公主机
+
+Your workstation does not need a public IP. Give it reachability with Tailscale or a reverse SSH tunnel, expose that route as an SSH config alias, and point Rah at the alias. The same alias is inherited by both the file and command planes.
+
+你的工作站不需要公网 IP。可以用 Tailscale 或反向 SSH 隧道提供可达性，再把连接写成 SSH config alias，最后让 Rah 使用这个 alias。文件挂载和命令执行会共同继承这套 SSH 配置。
+
+### 3. A trusted agent gateway for a team or lab / 团队或实验室的可信 agent 网关
+
+Run the agent on one trusted Linux host and let approved users reach that host through your existing access channel. Each user can mount their own remote project into an isolated working directory. The agent session stays centralized, while code, credentials, data, and compute remain on the correct remote host.
+
+让 agent 运行在一台可信的 Linux 主机上，用户通过现有的访问方式进入这台主机，再把各自的远端项目挂载到隔离的工作目录中。agent 会话集中管理，而代码、凭据、数据和算力仍然留在各自的远端机器上。
+
+This is an operational pattern for trusted environments, not a way to bypass provider policies or share credentials carelessly. Read the security notes before using it with other people or untrusted repositories.
+
+这是一种适用于可信环境的运维模式，不是绕过服务商政策或随意共享凭据的方法。和他人使用、或在不可信仓库中使用前，请先阅读安全说明。
+
+### 4. Multiple remote projects without multiple agent setups / 多个远程项目，一个 agent 环境
+
+Mount several projects under one agent host, switch directories, and use `rah status`, `rah remount`, and optional autostart to keep the working set healthy across network drops, laptop sleep, and reboots.
+
+在同一台 agent 主机上挂载多个项目，切换目录即可切换远端环境；配合 `rah status`、`rah remount` 和可选的自动恢复，可以应对网络中断、笔记本睡眠和重启后的恢复问题。
+
+## How it works / 工作原理
+
+Rah deliberately separates the file plane from the execution plane:
+
+Rah 有意把文件面和执行面分开：
+
+| Plane / 平面 | English | 中文 |
+|---|---|---|
+| File plane / 文件面 | SSHFS mounts the remote code tree into a local directory. | SSHFS 把远端代码树挂载到本地目录。 |
+| Execution plane / 执行面 | An agent hook rewrites Bash commands to `rah run`; Rah sends them over SSH and preserves the exit code. | agent hook 把 Bash 命令改写为 `rah run`；Rah 通过 SSH 发送命令并保留退出码。 |
+| Working directory / 工作目录 | The local mount path maps back to the remote project path before execution. | 执行前会把本地挂载路径映射回远端项目路径。 |
+| Recovery / 恢复 | `rah remount` and optional system services restore a dead or unmounted file plane. | `rah remount` 和可选的系统服务负责恢复失效或未挂载的文件面。 |
+
+```text
+agent file tools ──► local SSHFS mount ──► remote code tree
+agent commands ────► PreToolUse hook ────► rah run ──► SSH ──► remote shell
+```
+
+The agent sees a local directory and a normal shell. Commands run on the remote host with its environment, GPU, datasets, and credentials; the remote host does not need Rah installed.
+
+agent 看到的是本地目录和普通 shell。命令会在远端主机的环境中执行，可以直接使用远端 GPU、数据集和凭据；远端主机不需要安装 Rah。
+
+Rah is not a general-purpose file synchronization service. It is a remote development bridge: mount the code you edit, and keep datasets, outputs, caches, and model weights native to the machine that executes the workload.
+
+Rah 不是通用文件同步服务，而是远程开发桥接工具：挂载你需要编辑的代码，让数据集、输出、缓存和模型权重留在真正执行任务的机器上。
+
+## Quick start / 快速开始
+
+### 1. Install / 安装
+
+Install Rah on the machine that runs Claude Code or Codex. The remote host only needs SSH access, a POSIX-like shell, and `base64`.
+
+把 Rah 安装在运行 Claude Code 或 Codex 的机器上。远端只需要 SSH、类 Unix shell 和 `base64`。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Hiaa1/rah/main/install.sh | bash
-```
-
-Check that it works:
-
-```bash
 rah version
 ```
 
-If your shell cannot find `rah`, reopen the terminal or add `~/.local/bin` to `PATH`.
+For a production environment, inspect or pin the installer source instead of blindly executing an unpinned remote script.
 
-On macOS, if SSHFS is missing, the installer points you to the right path for your machine:
-Homebrew, MacPorts, or manual macFUSE + SSHFS installers. macFUSE may require approval in System
-Settings before the first mount works. To force a path, set `RAH_MACOS_SSHFS_INSTALLER=brew`,
-`macports`, or `manual`.
+在生产环境中，建议先检查或固定安装脚本版本，不要无条件执行未固定版本的远程脚本。
 
-If macFUSE shows a **System Extension Blocked** prompt on the first mount, choose **Open System
-Settings**, allow the macFUSE system extension in Privacy & Security, then try the mount again:
+### 2. Set up your first project / 配置第一个项目
 
-<p align="center">
-  <img src="assets/mac-deploy-fuse.png" alt="macOS macFUSE System Extension Blocked permission prompt" width="620">
-</p>
+Run setup in a real terminal. It may need to install local dependencies, authorize an SSH key, create a mount directory, or ask for macFUSE permissions on macOS.
 
-**Option 2: ask Claude Code / Codex to install it**
+请在真实终端运行 setup。它可能需要安装本地依赖、授权 SSH key、创建挂载目录，或者在 macOS 上请求 macFUSE 权限。
 
-In an agent session, say:
+```bash
+rah setup you@host:~/project
 
-> **"Install Rah from github.com/Hiaa1/rah and set it up for `you@host:~/project`."**
+# Non-default SSH port / 非默认 SSH 端口
+rah setup --port 2222 you@host:~/project
 
-The agent can download rah and prepare the commands. If it needs `sudo`, an SSH password,
-`ssh-copy-id`, or macFUSE/SSHFS install steps, run the command it prints in a real terminal once.
+# Explicit local mount path / 指定本地挂载目录
+rah setup you@host:~/project ~/projects/project
+```
 
-### Connect Your First Remote Project
+The interactive form is also available:
 
-Run this in a real terminal:
+也可以直接使用交互式向导：
 
 ```bash
 rah setup
 ```
 
-It asks for:
+It asks for the SSH target, port, remote project path, and local mount path. It wires hooks for any installed Claude Code or Codex configuration it finds, then mounts the project.
 
-- SSH target, for example `you@devbox.example.com`
-- SSH port, or press Enter for the default
-- Remote project directory, for example `~/project`
-- Local mount directory, or press Enter for the default `~/mnt_rah/<project>`
+向导会询问 SSH 目标、端口、远端项目路径和本地挂载路径；随后为检测到的 Claude Code 或 Codex 配置安装 hook，并挂载项目。
 
-If you already know the values, you can do it in one line:
-
-```bash
-rah setup you@host:~/project
-rah setup --port 2222 you@devbox.example.com:~/project
-rah setup you@host:~/project ~/projects/project
-```
-
-> `rah setup` may install local dependencies (`apt`, Homebrew, MacPorts, or manual macFUSE/SSHFS
-> steps), authorize your SSH key, or create a local directory. Those steps can ask for a password,
-> so run setup in a real terminal, not inside an agent shell without a TTY.
-
-### Start Developing
-
-After setup, enter the local mount:
+### 3. Start the agent / 启动 agent
 
 ```bash
 cd ~/mnt_rah/project
 rah verify
+codex       # or: claude
 ```
 
-When verification passes, start Claude Code / Codex from this directory. Use the agent normally:
+From this directory, use the agent normally. Ask it to edit files, run tests, inspect remote datasets, or launch a GPU job. The file edits land on the remote project, and the commands execute on the remote host.
 
-- the agent sees a local folder
-- files actually come from the remote project
-- shell commands actually execute on the remote
+进入这个目录后就可以正常使用 agent：让它修改文件、运行测试、读取远端数据集或启动 GPU 任务。文件修改会落到远端项目，命令也会在远端主机执行。
 
-Restart the agent once after the first hook install. After that, new projects only need another
-`rah setup` or `rah mount`; the agent does not need to be configured again. To remove everything,
-run `rah uninstall`.
+If Rah is not automatically wired during setup, run one of these commands and restart the agent once:
 
-## Remote Behind NAT (No Public IP)
+如果 setup 没有自动安装 hook，可以执行下面的命令之一，然后重启 agent 一次：
 
-Rah needs an SSH destination it can reach: exec runs `ssh <host>`, files come over
-`sshfs <host>:<path>`. If the remote sits behind NAT/CGNAT with no public IP, it cannot
-accept inbound SSH and both planes fail. NAT traversal is solved one layer **below** rah:
-give the remote a reachable address, expose it as an `~/.ssh/config` alias, then point
-`rah setup` at that alias. Rah needs no special flags — `ssh` and `sshfs` inherit the
-alias's `HostName`, `Port`, `ProxyJump`, and `ProxyCommand`.
+```bash
+rah init claude
+rah init codex
+```
 
-### Option 1 — Tailscale (recommended)
+## Supported environments / 支持的环境
 
-Works even when both ends are behind NAT (hole-punching with a DERP relay fallback); no
-public IP or VPS required.
+- **Agent host / agent 主机:** Linux or macOS with SSHFS/FUSE support. Ubuntu, Debian, WSL2, and macOS are the primary targets.
+- **Remote host / 远端主机:** Linux or macOS with OpenSSH, a POSIX-like shell, and `base64`. A Windows/WSL2 remote is experimental unless it provides the same environment.
+- **SSH:** Passwordless key-based access is required. `ssh <host> true` must succeed without a password prompt.
+- **Native Windows agent host / 原生 Windows agent 主机:** Not supported today; use WSL2 or SSH into a Linux agent host.
+- **Codex execution mode / Codex 执行模式:** Interactive CLI/TUI is the supported path; `codex exec` is not the target path today.
 
-1. Install Tailscale on both machines and bring them onto the same tailnet:
-   ```bash
-   tailscale up        # run on the remote and on the agent machine
-   tailscale status    # find the remote's MagicDNS name, e.g. gpu-home.tailXXXX.ts.net
-   ```
-2. Add an alias to `~/.ssh/config` on the agent machine:
-   ```
+本地 agent 主机需要 Linux 或 macOS，并支持 SSHFS/FUSE；主要目标是 Ubuntu、Debian、WSL2 和 macOS。远端主要支持 Linux/macOS，实验性支持提供类 Unix shell 的 Windows/WSL2。SSH 必须可以免密码执行，原生 Windows agent 主机目前不在支持范围内；Codex 目前支持交互式 CLI/TUI，不以 `codex exec` 为目标路径。
+
+### Local dependencies / 本地依赖
+
+On Linux, Rah expects `bash`, `ssh`, `sshfs`, `jq`, `base64`, `timeout`, `mountpoint`, and FUSE tools. On macOS, it expects `bash`, `ssh`, `sshfs` through macFUSE, `jq`, `base64`, and `perl`. `curl` is needed for installation and self-update.
+
+Linux 本地需要 `bash`、`ssh`、`sshfs`、`jq`、`base64`、`timeout`、`mountpoint` 和 FUSE 工具。macOS 本地需要 `bash`、`ssh`、通过 macFUSE 提供的 `sshfs`、`jq`、`base64` 和 `perl`。安装和自更新需要 `curl`。
+
+Run `rah doctor` to inspect the local environment. On macOS, Rah can guide you through Homebrew, MacPorts, or manual macFUSE/SSHFS installation.
+
+运行 `rah doctor` 可以检查本地环境。macOS 上 Rah 会提示使用 Homebrew、MacPorts 或手动安装 macFUSE/SSHFS。
+
+On macOS, the first mount may require approving the macFUSE system extension in System Settings. If `rah` is installed but your shell cannot find it, reopen the terminal or add `~/.local/bin` to `PATH`.
+
+在 macOS 上，第一次挂载可能需要在系统设置中允许 macFUSE 系统扩展。如果已经安装 Rah 但 shell 找不到命令，请重新打开终端，或把 `~/.local/bin` 加入 `PATH`。
+
+## Commands / 命令
+
+### Everyday commands / 日常命令
+
+| Command | Purpose / 用途 |
+|---|---|
+| `rah setup [target] [local-path]` | Guided first-time setup: dependencies, SSH, agent hook, and mount. / 首次向导：依赖、SSH、agent hook 和挂载。 |
+| `rah mount user@host:/path [local-path]` | Add a remote project mount. / 增加一个远端项目挂载。 |
+| `rah status [--current]` | Show mount, SSH, execution, autostart, and agent-hook health. / 查看挂载、SSH、执行面、自动恢复和 agent hook 状态。 |
+| `rah verify [name\|path]` | Run an end-to-end project and hook check. / 执行端到端项目和 hook 检查。 |
+| `rah remount [--force] [name\|path]` | Recover dead or unmounted projects. / 恢复失效或未挂载的项目。 |
+| `rah unmount <name\|path>` | Disconnect the mount but keep its configuration. / 断开挂载但保留配置。 |
+| `rah remove [--keep-local] [name\|path]` | Remove the mount configuration and optionally the empty local directory. / 删除挂载配置，并可删除空的本地目录。 |
+| `rah doctor` | Check local dependencies and managed mounts. / 检查本地依赖和受管理的挂载。 |
+| `rah init <claude\|codex>` | Install or remove the agent hook and Rah skill. / 安装或移除 agent hook 和 Rah skill。 |
+
+### Lifecycle and diagnostics / 生命周期与诊断
+
+| Command | Purpose / 用途 |
+|---|---|
+| `rah autostart on\|off\|status` | Restore managed mounts after login or reboot. / 在登录或重启后恢复受管理的挂载。 |
+| `rah hook-log on\|off\|status\|clear` | Inspect hook routing decisions. / 查看 hook 的路由决策。 |
+| `rah self-update` | Fetch the latest Rah script. / 获取最新 Rah 脚本。 |
+| `rah uninstall [--purge]` | Remove Rah hooks, skills, binary, and optionally configuration. / 移除 Rah hook、skill、程序和可选的配置。 |
+
+`rah run` and `rah hook` are plumbing commands used by the agent integration. They are useful for debugging and automation, but normal users should not need to prefix their commands with either one.
+
+`rah run` 和 `rah hook` 是 agent 集成使用的底层命令，适合调试和自动化；日常使用时不需要手动给命令加这两个前缀。
+
+### Advanced mount options / 高级挂载选项
+
+```bash
+# Name a mount, select a port, and prepare the remote environment
+# 指定挂载名、端口，并在每条远端命令前准备环境
+rah mount --name gpu-project --port 2222 --prelude 'source .venv/bin/activate' \
+  you@host:~/project ~/mnt_rah/gpu-project
+
+# Use the same absolute path on both hosts when you intentionally need it
+# 如果确实需要两端使用同一个绝对路径
+rah mount --same-path you@host:/home/you/project
+
+# Inspect all mounts or only the current project
+# 查看全部挂载或当前项目
+rah status --all
+rah status --current
+
+# Remove a hook without removing the rest of the agent configuration
+# 只移除 Rah hook，不删除 agent 的其他配置
+rah init claude --remove
+```
+
+Use `--prelude` for lightweight environment setup such as activating a virtual environment. Keep datasets and outputs outside the mounted code tree whenever possible.
+
+可以用 `--prelude` 做轻量的环境准备，例如激活虚拟环境。数据集和输出文件应尽量放在挂载代码树之外。
+
+## Remote behind NAT / 远端位于 NAT 后
+
+Rah needs a reachable SSH destination. If the remote cannot accept inbound SSH, solve reachability below Rah and then use an SSH config alias. Both SSH command execution and SSHFS mounting inherit `HostName`, `Port`, `ProxyJump`, and `ProxyCommand` from that alias.
+
+Rah 需要一个可达的 SSH 目标。如果远端无法接收入站 SSH，应先在 Rah 下面一层解决网络可达性，再使用 SSH config alias。命令执行和 SSHFS 挂载都会继承 alias 中的 `HostName`、`Port`、`ProxyJump` 和 `ProxyCommand`。
+
+### Tailscale / Tailscale
+
+Tailscale is the recommended option when both machines are behind NAT:
+
+当两台机器都位于 NAT 后时，推荐使用 Tailscale：
+
+1. Install Tailscale on both machines and join the same tailnet. / 在两台机器上安装 Tailscale 并加入同一个 tailnet。
+2. Add an alias on the agent host: / 在 agent 主机上添加 alias：
+
+   ```sshconfig
    Host gpu-home
        HostName gpu-home.tailXXXX.ts.net
        User you
    ```
-3. Use the alias as the rah target:
+
+3. Use the alias with Rah: / 使用 alias 配置 Rah：
+
    ```bash
    rah setup gpu-home:/home/you/project
    ```
 
-### Option 2 — Reverse SSH tunnel (self-hosted)
+### Reverse SSH tunnel / 反向 SSH 隧道
 
-Use this if you prefer not to depend on a third-party overlay and have a public relay
-(a cheap VPS, or any always-on machine with a public IP).
+If you have a public relay, keep a reverse tunnel from the remote host to the relay and expose the forwarded route as an SSH alias:
 
-1. On the remote, keep a reverse tunnel up to the relay (supervise it with `autossh`, a
-   systemd unit, or `tmux`):
-   ```bash
-   autossh -M 0 -N -R 2222:localhost:22 you@relay.example.com
-   ```
-2. On the agent machine, reach the remote through the relay-forwarded port:
-   ```
-   Host gpu-home
-       HostName localhost
-       Port 2222
-       ProxyJump you@relay.example.com
-       User you
-   ```
-3. Use the alias as the rah target:
-   ```bash
-   rah setup gpu-home:/home/you/project
-   ```
+如果你有公网中继机，可以让远端维持到中继机的反向隧道，再把转发路径配置成 SSH alias：
 
-Port and proxy settings live in `~/.ssh/config`; rah only uses the alias, and both the
-command-execution and the sshfs mount inherit it. If `rah setup`/`rah mount` reports an
-SSH preflight failure, rah prints these same options as a hint.
-
-## Commands
-
-| Command | Purpose |
-|---|---|
-| `rah setup [--port PORT] [user@host:/path] [local-path] [-y]` | guided onboarding: deps, ssh key, agent hooks, mount |
-| `rah mount [--name N] [--port PORT] [--prelude CMD] user@host:/path [local-path]` | mount a remote code tree locally; defaults to `~/mnt_rah/<project>` |
-| `rah mount --same-path user@host:/abs/path` | opt into identical local/remote path mode |
-| `rah remount [--force] [name\|path]` | recover dead/stale/unmounted mounts; all if no target; healthy mounts are skipped unless forced |
-| `rah unmount <name\|path>` | unmount + drop the ssh master, keep config |
-| `rah remove [--keep-local] [name\|path]` | unmount, remove rah config, rmdir empty mountpoint; current mount if omitted |
-| `rah autostart on\|off\|status` | keep managed mounts available after reboot/login with user-level services |
-| `rah init <claude\|codex> [--remove]` | install/remove the hook + skill for an agent |
-| `rah status [--all\|--current] [name\|path]` / `rah list` | global mount / ssh / exec / autostart / agent-hook health |
-| `rah verify [name\|path]` | end-to-end mount/ssh/hook check |
-| `rah doctor` | check dependencies, PATH, mount health |
-| `rah self-update` | update to the latest version |
-| `rah uninstall [--purge]` | remove hooks, skill, and the `rah` binary |
-| `rah run --cwd <dir> -- <cmd>` | run a command on the remote (used by the hook) |
-| `rah hook-log on\|off\|status\|clear` | enable/inspect hook diagnostics |
-
-## Mount management
-
-Use `rah status` or `rah list` to see every managed mount from `~/.config/rah`, including its
-name, remote path, local path, mount health, ssh reachability, and exec-plane health. Use
-`rah status --current` when you only want the mount that contains the current directory.
-
-- `rah unmount <name|path>` disconnects the mount but keeps the config, so `rah remount <name|path>` can recover it later.
-- `rah remove [name|path]` disconnects it, removes the rah config, and removes the local mountpoint only if the directory is empty.
-- `rah remove --keep-local [name|path]` removes rah's config while leaving the local directory in place.
-
-## How it works
-
-<p align="center">
-  <img src="assets/rah-workflow.png" alt="Rah workflow showing remote files mounted locally and commands routed back to the remote host" width="900">
-</p>
-
-```
-agent file tools ──► local sshfs mount ──► remote code tree
-agent commands ──► PreToolUse hook ──► rah run ──► ssh(ControlMaster) ──► remote: cd + prelude + cmd
+```bash
+autossh -M 0 -N -R 2222:localhost:22 you@relay.example.com
 ```
 
-The hook self-gates by working directory: outside a rah-managed mount it passes commands
-through unchanged, so it is safe even if other projects share the same agent. Commands are
-carried to the remote base64-encoded (no quoting/injection issues), and the remote exit code is
-propagated so the agent's run/verify loop works normally. In mapped mode, rah translates the
-local cwd and local absolute path prefixes back to the remote project path before execution.
-Standalone `cd` stays local so the shell's working directory is preserved across commands.
+Rah does not need a NAT-specific flag. It only needs the alias to work with both `ssh` and `sshfs`.
 
-## Recovery
+Rah 不需要额外的 NAT 参数，只要这个 alias 同时能被 `ssh` 和 `sshfs` 使用即可。
 
-A network drop, remote reboot, or laptop sleep can leave the sshfs mount **dead** — file tools
-then report `Transport endpoint is not connected` or hang. Because exec and files are separate
-channels, **command execution keeps working** while the mount is down. To recover the file plane:
+## Recovery and autostart / 恢复与自动启动
 
-- `rah remount` re-establishes ssh + sshfs (idempotent; runs locally even mid-session).
-- `rah autostart on` restores mounts automatically after reboot/login. On Linux it creates one
-  `systemd --user` service per mount, keeps SSHFS in the foreground, and restarts it on failure;
-  macOS uses a LaunchAgent to retry safe `rah remount` calls. Neither platform needs shell rc files
-  or `/etc/fstab`.
-- The hook also **self-heals**: while you're working it probes the mount (throttled, non-blocking)
-  and fires a background `rah remount` if it finds it dead — so it usually recovers on its own.
-- `rah status` reports `mounted` / `DEAD` / `not mounted` (a real liveness probe, not a stale flag).
+A network drop, remote reboot, or laptop sleep can leave an SSHFS mount in a dead state. File tools may report `Transport endpoint is not connected` or hang, while the separate SSH execution plane can still work.
 
-## Hook diagnostics
+网络中断、远端重启或笔记本睡眠可能让 SSHFS 挂载进入 dead 状态。文件工具可能报 `Transport endpoint is not connected` 或卡住，但独立的 SSH 执行面仍可能继续工作。
 
-If an agent appears to run locally from inside a managed mount, enable the hook log and retry one
-command:
+```bash
+rah status
+rah remount
+```
+
+`rah remount` is idempotent and can be run from inside an agent session because it executes on the local control plane. The hook also performs throttled background recovery checks while you work.
+
+`rah remount` 具有幂等性，即使在 agent 会话中也可以执行，因为它运行在本地控制面。工作过程中 hook 还会节流地进行后台恢复检查。
+
+Enable optional persistence when mounts should return after login or reboot:
+
+如果希望登录或重启后自动恢复挂载，可以启用可选的持久化：
+
+```bash
+rah autostart on
+rah autostart status
+```
+
+Linux uses `systemd --user`; macOS uses a LaunchAgent. Disable it with `rah autostart off`.
+
+Linux 使用 `systemd --user`，macOS 使用 LaunchAgent。可以用 `rah autostart off` 关闭。
+
+## Hook diagnostics / Hook 诊断
+
+If a command appears to run locally from inside a managed mount, enable the hook log and retry one command:
+
+如果 agent 在受管理挂载内看起来仍然在本地执行，可以开启 hook 日志并重试一条命令：
 
 ```bash
 rah hook-log on
 rah hook-log clear
 ```
 
-Then run the suspect command in the agent and inspect `~/.config/rah/hook.jsonl`. Each JSONL entry
-records whether the hook fired, the reported/effective cwd, mount match, route vs passthrough, and
-the emitted decision. Disable it with `rah hook-log off`. For one-off debugging without changing the
-flag file, launch the agent with `RAH_HOOK_LOG=1` or set it to a log path.
+Inspect `~/.config/rah/hook.jsonl`, then disable logging:
 
-## Agent support
+查看 `~/.config/rah/hook.jsonl`，完成后关闭日志：
 
-| Agent | Status | Hook installed by `rah init` |
+```bash
+rah hook-log off
+```
+
+The log can contain command text. Do not leave it enabled around secrets, tokens, or sensitive arguments.
+
+日志可能包含命令文本。涉及 secret、token 或敏感参数时，不要长时间开启日志。
+
+## Agent support / Agent 支持
+
+| Agent | Current target / 当前目标 | Hook installed by `rah init` |
 |---|---|---|
-| Claude Code v2.1.158+ | tested | `rah hook --decision allow` |
-| Codex CLI v0.137.0+ interactive TUI | tested | `rah hook --decision allow --passthrough empty` |
+| Claude Code | v2.1.158+ | `rah hook --decision allow` |
+| Codex CLI | v0.137.0+ interactive TUI | `rah hook --decision allow --passthrough empty` |
 
-Codex may ask you to review hooks after install or update. Choose **Trust all and continue** for the
-rah hook, then commands launched from a managed mount route to the remote. `codex exec` is not the
-target path for rah today; use the interactive CLI/TUI for transparent remote execution.
+Codex may ask you to review hooks after installation or update. Review the command and choose the trust option only when you understand and accept that commands inside Rah-managed mounts will be routed to the remote host.
 
-## Requirements
+Codex 安装或更新后可能要求 review hook。只有在理解并接受“Rah 管理挂载内的命令会被转发到远端”这一行为后，才应选择信任选项。
 
-- **Supported agent host:** Linux or macOS with sshfs/FUSE support; primary targets are Ubuntu,
-  Debian, WSL2, and macOS. Native Windows is not supported.
-- **Linux local packages:** `bash`, `ssh`, `sshfs` (+ `fuse`/`fuse3`), `jq`, `coreutils`
-  (`base64`, `timeout`), `util-linux` (`mountpoint`); `curl` for install/self-update.
-- **macOS local packages:** `bash`, `ssh`, `sshfs` through macFUSE, `jq`, `base64`, and `perl`;
-  `curl` for install/self-update. For SSHFS/macFUSE, use Homebrew
-  (`brew install --cask sshfs-mac`), MacPorts (`sudo port install sshfs`), or the official
-  macFUSE + SSHFS installer packages. `rah` can find SSHFS in the usual Homebrew/MacPorts
-  locations even if it is not on PATH. Run `rah doctor` to check.
-- **SSH:** passwordless key-based ssh to the remote — `ssh <host> true` must succeed without a
-  prompt. `rah setup` preflights this and can authorize your key with `ssh-copy-id` or an
-  ssh-based fallback.
-- **Remote:** a standard OpenSSH server, POSIX shell, and `base64`. A Linux server/workstation or an
-  SSH-enabled macOS machine can be a remote target.
+## Security / 安全
 
-## Security
+Rah changes where agent commands execute. The installed hooks use `permissionDecision: "allow"` because the supported agent integrations require an allow decision for command rewrites to take effect. Inside a Rah-managed mount, the hook approves and routes the command after checking the working-directory boundary; outside a managed mount, commands pass through unchanged.
 
-`rah` reroutes the agent's command execution to a remote host over ssh. Claude and Codex currently
-require `permissionDecision: "allow"` for `updatedInput.command` rewrites to take effect, so
-`rah init claude` and `rah init codex` install allow-mode hooks. Commands inside a rah-managed mount
-are approved by the hook after cwd gating; outside a managed mount they pass through unchanged
-(Claude receives `defer`, while Codex receives an empty hook response). Use `rah hook-log` when you
-need to inspect routing decisions.
+Rah 会改变 agent 命令的实际执行位置。由于当前 agent 集成要求 `allow` 决策才能应用命令改写，Rah 安装的 hook 会使用 `permissionDecision: "allow"`。在 Rah 管理的挂载内，hook 检查工作目录边界后批准并转发命令；在挂载外，命令保持原样放行。
 
-## License
+Only install Rah hooks on an agent host you trust. Treat a managed remote project as a command-execution boundary: prompt injection or malicious project instructions can cause the agent to execute commands on that remote host. Keep SSH permissions narrow, review hooks after installation, and use `rah hook-log` only when needed.
+
+只在你信任的 agent 主机上安装 Rah hook。请把受管理的远程项目视为一个命令执行边界：提示注入或恶意项目指令可能诱导 agent 在远端执行命令。请收紧 SSH 权限，安装后 review hook，并只在需要时开启 `rah hook-log`。
+
+## Limitations / 当前限制
+
+- Native Windows as the agent host is not supported. Use WSL2 or a Linux agent host. / 不支持原生 Windows 作为 agent 主机，请使用 WSL2 或 Linux agent 主机。
+- SSHFS is designed for source trees, not large datasets or high-throughput storage. / SSHFS 适合代码树，不适合作为大型数据集或高吞吐存储层。
+- The remote host must provide a compatible shell and `base64`; a normal Windows command environment is not a stable target. / 远端需要兼容的 shell 和 `base64`，普通 Windows 命令环境不是稳定目标。
+- `codex exec` is not the supported transparent-routing path today. / 当前不支持通过 `codex exec` 实现透明远端执行。
+
+## License / 许可证
 
 [MIT](LICENSE)
