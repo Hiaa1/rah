@@ -1100,6 +1100,9 @@ cmd_hook() {
     esac
   done
   case "$decision" in defer|allow|ask) ;; *) decision="defer" ;; esac
+  # --passthrough is still parsed so hooks already registered with
+  # "--passthrough empty" keep working; passthrough now always emits nothing,
+  # so the value itself is no longer consulted.
   case "$passthrough_output" in defer|empty) ;; *) passthrough_output="defer" ;; esac
 
   local input cmd cwd reported_cwd tool_cwd tool
@@ -1159,14 +1162,14 @@ cmd_hook() {
 
   if [ "$passthrough" -eq 1 ] || [ -z "$cmd" ]; then
     [ -n "$cmd" ] || reason="empty-command"
-    local emitted="defer"
-    [ "$passthrough_output" = "empty" ] && emitted=""
     _hook_log_event "$tool" "$reported_cwd" "$tool_cwd" "$cwd" "$matched" "$cfg" \
-      "passthrough" "$reason" "$decision" "$emitted" 0 "$cmd"
-    if [ "$passthrough_output" = "empty" ]; then
-      return 0
-    fi
-    jq -nc '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"defer"}}'
+      "passthrough" "$reason" "$decision" "" 0 "$cmd"
+    # Emit nothing. "defer" is a valid PreToolUse permissionDecision, but its
+    # semantics are print-mode only: an interactive agent warns and ignores it,
+    # while a non-interactive/print session takes a branch that drops the tool
+    # result outright, so every passthrough command fails there. Both agents
+    # want the same thing here anyway -- "no opinion, run normally" -- which the
+    # hook protocol expresses as exit 0 with no output.
     return 0
   fi
 
