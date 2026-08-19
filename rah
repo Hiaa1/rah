@@ -775,6 +775,15 @@ _ensure_master() {
   local host="$1" socket="$2" port="${3:-}" ssh_args=()
   [ -n "$port" ] && ssh_args=(-p "$port")
   ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && return 0
+  # The check failed, but the socket *file* may still be there from a master that
+  # died without cleaning up. ssh refuses to reuse an existing path ("ControlSocket
+  # ... already exists, disabling multiplexing") and then -fN backgrounds a
+  # connection that owns no socket, so ControlPersist never reaps it: every later
+  # call leaks one more. Drop the stale file before creating the master.
+  if [ -e "$socket" ]; then
+    ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
+    rm -f "$socket"
+  fi
   ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host"
 }
 
