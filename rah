@@ -1384,6 +1384,38 @@ _disable_legacy_systemd_autostart() {
   rm -f "$(_systemd_legacy_service_path)" "$(_systemd_legacy_timer_path)"
 }
 
+# systemd --user does not inherit the login session's environment, so a key that
+# lives only in an ssh-agent is invisible to rah-mount@ units: the mount fails,
+# Restart=on-failure retries every RestartSec, and nothing ever says why. Hand the
+# live agent to the user manager (the documented systemd mechanism) and report the
+# hosts that cannot authenticate without one, so the failure is loud now rather
+# than silent after the next reboot.
+_autostart_ssh_agent_preflight() {
+  local cfg host port seen=" " needs="" ssh_args=()
+  if [ -n "${SSH_AUTH_SOCK:-}" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user import-environment SSH_AUTH_SOCK >/dev/null 2>&1 || true
+  fi
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    host="$(_get "$cfg" host)"; port="$(_get "$cfg" ssh_port)"
+    [ -n "$host" ] || continue
+    case "$seen" in *" $host|$port "*) continue ;; esac
+    seen="$seen$host|$port "
+    ssh_args=(); [ -n "$port" ] && ssh_args=(-p "$port")
+    SSH_AUTH_SOCK="" ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 \
+      -o IdentityAgent=none "$host" true 2>/dev/null && continue
+    # Agent-less auth failed. Only call that an autostart problem if the host is
+    # otherwise reachable -- a host that is simply down fails this probe too, and
+    # `rah status` is where that belongs.
+    _ssh_ok "$host" "$port" || continue
+    needs="$needs $host"
+  done < <(_list_configs)
+  [ -n "$needs" ] || return 0
+  _say_warn "these hosts authenticate only through an ssh-agent:$needs"
+  _say_note "the agent was handed to systemd --user for this session, but it is gone after a reboot;"
+  _say_note "add an on-disk key for them, or start an agent from a systemd --user unit."
+}
+
 _autostart_enable_systemd() {
   local cfg name enabled=0 failed=0
   _write_systemd_autostart
@@ -1402,6 +1434,7 @@ _autostart_enable_systemd() {
         failed=1
       fi
     done < <(_list_configs)
+    _autostart_ssh_agent_preflight
     if [ "$enabled" -gt 0 ]; then
       _say_ok "automatic recovery enabled for $enabled mount(s)"
     else
