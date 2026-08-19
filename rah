@@ -1108,8 +1108,13 @@ cmd_run() {
 
   local cfg
   if ! cfg="$(_config_for_cwd "$cwd")"; then
-    # Not under any managed mount -> run locally (safety fallthrough).
-    bash -c "$cmd"; exit $?
+    # `rah run` exists only to reach a remote: the hook rewrites a command into it
+    # precisely because the cwd was inside a managed mount. Arriving here means the
+    # mount went away in between (config removed or renamed, a rewritten command
+    # replayed later), and the command was written for the remote. Running it here
+    # anyway is worse than failing: `bash -c` executes it locally *and* in rah's own
+    # PWD rather than --cwd, so `rm -rf build` would hit an unrelated local tree.
+    _die "run: $cwd is not inside a managed rah mount; refusing to run the command locally (see: rah status)"
   fi
   local host socket prelude remote_cwd port ssh_args=()
   host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; prelude="$(_get "$cfg" prelude)"; port="$(_get "$cfg" ssh_port)"
