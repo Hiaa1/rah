@@ -772,19 +772,54 @@ RAHSKILL
 
 # Ensure a persistent ssh master connection at $socket. Returns non-zero on failure.
 _ensure_master() {
-  local host="$1" socket="$2" port="${3:-}" ssh_args=()
+  local host="$1" socket="$2" port="${3:-}" ssh_args=() lock held=0 i rc=0 lock_mtime
   [ -n "$port" ] && ssh_args=(-p "$port")
   ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && return 0
-  # The check failed, but the socket *file* may still be there from a master that
-  # died without cleaning up. ssh refuses to reuse an existing path ("ControlSocket
-  # ... already exists, disabling multiplexing") and then -fN backgrounds a
-  # connection that owns no socket, so ControlPersist never reaps it: every later
-  # call leaks one more. Drop the stale file before creating the master.
+
+  # Creating the master is check-then-act, and ssh cannot adopt a socket path that
+  # already exists: concurrent creators all miss the check, all run the create, and
+  # every loser is left as an unmultiplexed -fN process that ControlPersist never
+  # reaps. That is not hypothetical -- `rah autostart on` starts every unit at once
+  # and two mounts can share one host. mkdir is the portable atomic mutex; a lock
+  # nobody has touched for a minute belongs to a caller that died mid-flight.
+  lock="$socket.lock"
+  for ((i = 0; i < 60; i++)); do
+    if mkdir "$lock" 2>/dev/null; then held=1; break; fi
+    # Reap only a lock whose age we can positively read and prove old: treating an
+    # unreadable mtime as "stale" would yank the lock out from under a live holder,
+    # which puts the race straight back.
+    lock_mtime="$(_file_mtime "$lock" 2>/dev/null || true)"
+    if [ -n "$lock_mtime" ] && [ "$(( $(date +%s) - lock_mtime ))" -ge 60 ]; then
+      rmdir "$lock" 2>/dev/null || true
+    fi
+    sleep 0.5
+  done
+
+  # Whoever held the lock may have created the master while we waited.
+  if ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null; then
+    [ "$held" = 1 ] && rmdir "$lock" 2>/dev/null || true
+    return 0
+  fi
+
+  # The socket *file* can also outlive a master that died without cleaning up. ssh
+  # then prints "ControlSocket ... already exists, disabling multiplexing" and leaks
+  # in exactly the same way, so drop the stale path before creating the master.
   if [ -e "$socket" ]; then
     ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
     rm -f "$socket"
   fi
-  ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host"
+  ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host" || rc=$?
+  # With ControlPersist, -f returns as soon as the master is forked, before it has
+  # bound the socket. Releasing the lock here would let the next caller's check miss
+  # again and create a second master, so hold it until the socket actually answers.
+  if [ "$rc" -eq 0 ]; then
+    for ((i = 0; i < 40; i++)); do
+      ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && break
+      sleep 0.25
+    done
+  fi
+  [ "$held" = 1 ] && rmdir "$lock" 2>/dev/null || true
+  return "$rc"
 }
 
 _remote_uname() {
