@@ -1312,8 +1312,13 @@ cmd_systemd_mount() {
   host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
   mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
   state="$(_mount_state "$mp")"
-  [ "$state" = mounted ] && return 0
-  [ "$state" = dead ] && _unmount_fuse "$mp" 2>/dev/null || true
+  # A mount already sitting here belongs to somebody else (a manual `rah mount`),
+  # never to this service: ExecStart has to stay in the foreground for the unit to
+  # own the sshfs lifecycle, so returning 0 would finish the service and fire
+  # ExecStop, which unmounts the very mount we just found. Take it over instead.
+  case "$state" in
+    mounted|dead) _unmount_fuse "$mp" 2>/dev/null || true ;;
+  esac
   mp="$(_prepare_mountpoint "$mp" 0)" || return 1
   _do_mount "$host" "$remote_path" "$mp" "$socket" "$port" 1
 }
