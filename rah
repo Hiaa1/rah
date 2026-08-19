@@ -2150,7 +2150,18 @@ cmd_doctor() {
 
 cmd_self_update() {
   command -v curl >/dev/null 2>&1 || _die "curl required for self-update"
-  local dest tmp newver; dest="$(_self_path)"; tmp="$(mktemp)"
+  local dest tmp newver repo=""; dest="$(_self_path)"
+  # The usual developer install is a symlink into a clone, and _self_path resolves
+  # it, so a plain `mv` would rewrite a tracked file in the working tree: local
+  # commits get shadowed and `git status` goes dirty for no visible reason. Let git
+  # own a git checkout.
+  if command -v git >/dev/null 2>&1; then
+    repo="$(git -C "$(dirname "$dest")" rev-parse --show-toplevel 2>/dev/null || true)"
+  fi
+  if [ -n "$repo" ] && git -C "$repo" ls-files --error-unmatch "$dest" >/dev/null 2>&1; then
+    _die "self-update would overwrite a tracked file in a git checkout:\n  $dest\n  update it with git instead: git -C $(_shq "$repo") pull"
+  fi
+  tmp="$(mktemp)"
   _say_header "Self-update"
   _say_note "fetching $RAH_RAW_URL"
   curl -fsSL "$RAH_RAW_URL" -o "$tmp" || { rm -f "$tmp"; _die "download failed"; }
