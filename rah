@@ -772,10 +772,54 @@ RAHSKILL
 
 # Ensure a persistent ssh master connection at $socket. Returns non-zero on failure.
 _ensure_master() {
-  local host="$1" socket="$2" port="${3:-}" ssh_args=()
+  local host="$1" socket="$2" port="${3:-}" ssh_args=() lock held=0 i rc=0 lock_mtime
   [ -n "$port" ] && ssh_args=(-p "$port")
   ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && return 0
-  ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host"
+
+  # Creating the master is check-then-act, and ssh cannot adopt a socket path that
+  # already exists: concurrent creators all miss the check, all run the create, and
+  # every loser is left as an unmultiplexed -fN process that ControlPersist never
+  # reaps. That is not hypothetical -- `rah autostart on` starts every unit at once
+  # and two mounts can share one host. mkdir is the portable atomic mutex; a lock
+  # nobody has touched for a minute belongs to a caller that died mid-flight.
+  lock="$socket.lock"
+  for ((i = 0; i < 60; i++)); do
+    if mkdir "$lock" 2>/dev/null; then held=1; break; fi
+    # Reap only a lock whose age we can positively read and prove old: treating an
+    # unreadable mtime as "stale" would yank the lock out from under a live holder,
+    # which puts the race straight back.
+    lock_mtime="$(_file_mtime "$lock" 2>/dev/null || true)"
+    if [ -n "$lock_mtime" ] && [ "$(( $(date +%s) - lock_mtime ))" -ge 60 ]; then
+      rmdir "$lock" 2>/dev/null || true
+    fi
+    sleep 0.5
+  done
+
+  # Whoever held the lock may have created the master while we waited.
+  if ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null; then
+    [ "$held" = 1 ] && rmdir "$lock" 2>/dev/null || true
+    return 0
+  fi
+
+  # The socket *file* can also outlive a master that died without cleaning up. ssh
+  # then prints "ControlSocket ... already exists, disabling multiplexing" and leaks
+  # in exactly the same way, so drop the stale path before creating the master.
+  if [ -e "$socket" ]; then
+    ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
+    rm -f "$socket"
+  fi
+  ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host" || rc=$?
+  # With ControlPersist, -f returns as soon as the master is forked, before it has
+  # bound the socket. Releasing the lock here would let the next caller's check miss
+  # again and create a second master, so hold it until the socket actually answers.
+  if [ "$rc" -eq 0 ]; then
+    for ((i = 0; i < 40; i++)); do
+      ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && break
+      sleep 0.25
+    done
+  fi
+  [ "$held" = 1 ] && rmdir "$lock" 2>/dev/null || true
+  return "$rc"
 }
 
 _remote_uname() {
@@ -1064,8 +1108,13 @@ cmd_run() {
 
   local cfg
   if ! cfg="$(_config_for_cwd "$cwd")"; then
-    # Not under any managed mount -> run locally (safety fallthrough).
-    bash -c "$cmd"; exit $?
+    # `rah run` exists only to reach a remote: the hook rewrites a command into it
+    # precisely because the cwd was inside a managed mount. Arriving here means the
+    # mount went away in between (config removed or renamed, a rewritten command
+    # replayed later), and the command was written for the remote. Running it here
+    # anyway is worse than failing: `bash -c` executes it locally *and* in rah's own
+    # PWD rather than --cwd, so `rm -rf build` would hit an unrelated local tree.
+    _die "run: $cwd is not inside a managed rah mount; refusing to run the command locally (see: rah status)"
   fi
   local host socket prelude remote_cwd port ssh_args=()
   host="$(_get "$cfg" host)"; socket="$(_get "$cfg" control_socket)"; prelude="$(_get "$cfg" prelude)"; port="$(_get "$cfg" ssh_port)"
@@ -1303,8 +1352,13 @@ cmd_systemd_mount() {
   host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
   mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
   state="$(_mount_state "$mp")"
-  [ "$state" = mounted ] && return 0
-  [ "$state" = dead ] && _unmount_fuse "$mp" 2>/dev/null || true
+  # A mount already sitting here belongs to somebody else (a manual `rah mount`),
+  # never to this service: ExecStart has to stay in the foreground for the unit to
+  # own the sshfs lifecycle, so returning 0 would finish the service and fire
+  # ExecStop, which unmounts the very mount we just found. Take it over instead.
+  case "$state" in
+    mounted|dead) _unmount_fuse "$mp" 2>/dev/null || true ;;
+  esac
   mp="$(_prepare_mountpoint "$mp" 0)" || return 1
   _do_mount "$host" "$remote_path" "$mp" "$socket" "$port" 1
 }
