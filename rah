@@ -5,7 +5,7 @@
 # hook) to run on the remote — deterministically, with no model awareness.
 set -euo pipefail
 
-RAH_VERSION="0.4.1"
+RAH_VERSION="0.5.0"
 RAH_CONFIG_DIR="${RAH_CONFIG_DIR:-$HOME/.config/rah}"
 RAH_REPO="${RAH_REPO:-Hiaa1/rah}"
 RAH_RAW_URL="${RAH_RAW_URL:-https://raw.githubusercontent.com/$RAH_REPO/main/rah}"
@@ -13,6 +13,10 @@ RAH_BIN_DIR="${RAH_BIN_DIR:-$HOME/.local/bin}"
 RAH_MOUNT_ROOT="${RAH_MOUNT_ROOT:-$HOME/mnt_rah}"
 RAH_HOOK_LOG_DEFAULT="$RAH_CONFIG_DIR/hook.jsonl"
 RAH_HOOK_LOG_FLAG="$RAH_CONFIG_DIR/hook-log"
+RAH_LOCAL_ALLOW_FILE="$RAH_CONFIG_DIR/local-allow"
+# A whitelist is a handful of paths; anything larger is a corrupt or wrong file,
+# and scanning it would stall every Bash tool call.
+RAH_LOCAL_ALLOW_MAX_BYTES=65536
 RAH_UNAME="$(uname -s 2>/dev/null || echo unknown)"
 
 _is_macos() { [ "$RAH_UNAME" = Darwin ]; }
@@ -84,6 +88,12 @@ _trim_leading_ws() {
   printf '%s' "${s#"${s%%[![:space:]]*}"}"
 }
 
+_trim_ws() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  printf '%s' "${s%"${s##*[![:space:]]}"}"
+}
+
 _timeout() {
   local seconds="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
@@ -104,6 +114,14 @@ _file_mtime() {
     stat -f %m "$1"
   else
     stat -c %Y "$1"
+  fi
+}
+
+_file_size() {
+  if _is_macos; then
+    stat -f %z "$1"
+  else
+    stat -c %s "$1"
   fi
 }
 
@@ -642,6 +660,7 @@ _hook_log_path() {
 _hook_log_event() {
   local tool="$1" reported_cwd="$2" tool_cwd="$3" effective_cwd="$4" matched="$5" cfg="$6"
   local action="$7" reason="$8" configured_decision="$9" emitted_decision="${10}" updated="${11}" command="${12}"
+  local allow_entry="${13:-}"
   local path dir command_log truncated=0
   path="$(_hook_log_path)" || return 0
   dir="$(dirname "$path")"
@@ -667,6 +686,7 @@ _hook_log_event() {
     --arg configured_decision "$configured_decision" \
     --arg emitted_decision "$emitted_decision" \
     --arg command "$command_log" \
+    --arg local_allow "$allow_entry" \
     --argjson matched_mount "$matched" \
     --argjson updated_input "$updated" \
     --argjson command_truncated "$truncated" \
@@ -675,7 +695,120 @@ _hook_log_event() {
       matched_mount:$matched_mount,config:(if $cfg == "" then null else $cfg end),
       action:$action,reason:$reason,configured_decision:$configured_decision,
       emitted_decision:$emitted_decision,updated_input:$updated_input,
-      command:$command,command_truncated:$command_truncated}' >> "$path" 2>/dev/null || true
+      command:$command,command_truncated:$command_truncated}
+     + (if $local_allow == "" then {} else {local_allow_entry:$local_allow} end)' >> "$path" 2>/dev/null || true
+}
+
+# ---------- local allow list ----------
+#
+# A global opt-out from remote routing: a command that invokes one of these absolute
+# paths runs on this host even inside a managed mount. What gets whitelisted is the
+# agent-side toolchain (ask-codex, ask-gemini, ...), which has nothing to do with any
+# particular mount, so this is one global file with one absolute path per line.
+#
+# Every failure mode here — no file, unreadable file, junk contents, a bad line —
+# must fall back to the normal remote route. rah's guarantee is that commands run on
+# the remote and this list is an explicit hole in that guarantee; when the hole
+# cannot be read, we return to the guarantee, not to the hole.
+
+# Non-zero when the entry is usable; otherwise print why it is not. Relative paths
+# and bare command names are refused because a bare name ("python", "bash") would
+# match every invocation and switch rah off wholesale; patterns are refused because
+# rah never globs an entry, so one could only ever be a path that cannot exist.
+_local_allow_invalid_reason() {
+  local entry="$1"
+  case "$entry" in
+    "") printf 'empty\n'; return 0 ;;
+    /*) ;;
+    *)  printf 'not-an-absolute-path\n'; return 0 ;;
+  esac
+  case "$entry" in
+    *[*?[]*) printf 'wildcard-or-pattern\n'; return 0 ;;
+  esac
+  case "$entry" in
+    *[[:cntrl:]]*) printf 'control-character\n'; return 0 ;;
+  esac
+  return 1
+}
+
+# Record a rejected line (or an unusable file) in the hook log. Best effort, and
+# subject to the same on/off flag as every other hook event.
+_local_allow_log_skip() {
+  local entry="$1" reason="$2" path dir
+  path="$(_hook_log_path)" || return 0
+  dir="$(dirname "$path")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  # A corrupt file's "line" can be arbitrarily long; log enough to recognise it.
+  [ "${#entry}" -gt 200 ] && entry="${entry:0:200}"
+  jq -nc \
+    --arg ts "$(date -Is 2>/dev/null || date)" \
+    --arg pid "$$" \
+    --arg file "$RAH_LOCAL_ALLOW_FILE" \
+    --arg reason "$reason" \
+    --arg entry "$entry" \
+    '{ts:$ts,pid:($pid|tonumber),event:"LocalAllowSkip",file:$file,reason:$reason,
+      entry:(if $entry == "" then null else $entry end)}' >> "$path" 2>/dev/null || true
+}
+
+# One record per meaningful line of the list (blank lines and # comments produce
+# none): "ok <entry>" or "skip <reason> <raw line>". A file that cannot be used at
+# all yields no records, which is what makes every failure mode route to the remote.
+_local_allow_scan() {
+  local file="$RAH_LOCAL_ALLOW_FILE" size line entry reason
+  [ -e "$file" ] || return 0
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    _local_allow_log_skip "" "unreadable-file"
+    return 0
+  fi
+  size="$(_file_size "$file" 2>/dev/null)" || size=""
+  case "$size" in
+    ''|*[!0-9]*) _local_allow_log_skip "" "unreadable-file"; return 0 ;;
+  esac
+  if [ "$size" -gt "$RAH_LOCAL_ALLOW_MAX_BYTES" ]; then
+    _local_allow_log_skip "" "file-too-large"
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    entry="$(_trim_ws "$line")"
+    [ -n "$entry" ] || continue
+    case "$entry" in '#'*) continue ;; esac
+    if reason="$(_local_allow_invalid_reason "$entry")"; then
+      _local_allow_log_skip "$entry" "$reason"
+      printf 'skip %s %s\n' "$reason" "$entry"
+      continue
+    fi
+    printf 'ok %s\n' "$entry"
+  done < "$file"
+}
+
+_local_allow_entries() {
+  local record
+  while IFS= read -r record; do
+    case "$record" in
+      "ok "*) printf '%s\n' "${record#ok }" ;;
+    esac
+  done < <(_local_allow_scan)
+}
+
+# Print the whitelist entry that command $1 invokes, if any. The entry must sit at
+# the very start of the command (leading whitespace aside) and end on a boundary, so
+# /a/b/x.sh never matches /a/b/x.shX and `echo /a/b/x.sh` never matches at all.
+_local_allow_match() {
+  local cmd entry rest
+  cmd="$(_trim_leading_ws "$1")"
+  [ -n "$cmd" ] || return 1
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$cmd" in
+      "$entry")  printf '%s\n' "$entry"; return 0 ;;
+      "$entry"*) rest="${cmd#"$entry"}" ;;
+      *)         continue ;;
+    esac
+    case "$rest" in
+      [[:space:]]*|\"*|\'*) printf '%s\n' "$entry"; return 0 ;;
+    esac
+  done < <(_local_allow_entries)
+  return 1
 }
 
 # Space-separated packages for any missing required deps (deduped; empty if all present).
@@ -736,6 +869,12 @@ Execution routing is automatic; never wrap commands in ssh manually.
 - `rah unmount <name|path>` — unmount and drop the ssh master connection, keeping the config.
 - `rah remove [--keep-local] [name|path]` — unmount, remove rah config, and remove the empty mountpoint directory.
 - `rah init <claude|codex>` — install the routing hook and this skill for an agent.
+- `rah local-allow list | add <absolute-path> | remove <absolute-path>` — a global whitelist of
+  absolute paths that keep running **on this machine** even inside a mount (agent-side tools such
+  as `ask-codex.sh`, which exist here and not on the remote). A command matches only when it
+  *starts* with a listed path, so `echo /path/tool.sh` still goes remote. Entries must be absolute
+  paths: relative paths, bare command names and patterns are rejected. Everything else — including
+  a missing or malformed list — routes to the remote as usual.
 
 ## Recovery
 
@@ -1209,10 +1348,24 @@ cmd_hook() {
       esac ;;
   esac
 
+  # Last stop before the command is handed to the remote: a command that invokes a
+  # globally whitelisted absolute path stays on this host. Only consulted when the
+  # command would otherwise be routed, so nothing outside a managed mount changes.
+  local allow_entry="" action="passthrough"
+  if [ "$passthrough" -eq 0 ] && [ -n "$cmd" ]; then
+    if allow_entry="$(_local_allow_match "$cmd")" && [ -n "$allow_entry" ]; then
+      passthrough=1
+      reason="local-allow"
+      action="local"
+    else
+      allow_entry=""
+    fi
+  fi
+
   if [ "$passthrough" -eq 1 ] || [ -z "$cmd" ]; then
     [ -n "$cmd" ] || reason="empty-command"
     _hook_log_event "$tool" "$reported_cwd" "$tool_cwd" "$cwd" "$matched" "$cfg" \
-      "passthrough" "$reason" "$decision" "" 0 "$cmd"
+      "$action" "$reason" "$decision" "" 0 "$cmd" "$allow_entry"
     # Emit nothing. "defer" is a valid PreToolUse permissionDecision, but its
     # semantics are print-mode only: an interactive agent warns and ignores it,
     # while a non-interactive/print session takes a branch that drops the tool
@@ -1275,6 +1428,87 @@ cmd_hook_log() {
 	      ;;
     *)
       _die "usage: rah hook-log on [path] | off | status | clear [path]"
+      ;;
+  esac
+}
+
+cmd_local_allow() {
+  local action="${1:-list}" arg entry record raw reason tmp existing any=0 found=0
+  [ $# -gt 0 ] && shift || true
+  arg="${1:-}"
+  case "$action" in
+    list)
+      _say_header "local allow list"
+      _say_note "$RAH_LOCAL_ALLOW_FILE"
+      while IFS= read -r record; do
+        case "$record" in
+          "ok "*)
+            any=1; _say_cmd "${record#ok }" ;;
+          "skip "*)
+            raw="${record#skip }"; reason="${raw%% *}"; raw="${raw#* }"
+            # A corrupt file's "line" is binary junk: keep it short and printable
+            # so listing a broken list cannot garble the terminal.
+            [ "${#raw}" -gt 120 ] && raw="${raw:0:120}..."
+            raw="$(printf '%s' "$raw" | tr -d '[:cntrl:]')"
+            _say_warn "ignored ($reason): $raw" ;;
+        esac
+      done < <(_local_allow_scan)
+      [ "$any" -eq 1 ] || _say_note "none"
+      ;;
+    add)
+      [ -n "$arg" ] || _die "usage: rah local-allow add <absolute-path>"
+      entry="$(_trim_ws "$arg")"
+      if reason="$(_local_allow_invalid_reason "$entry")"; then
+        _die "local-allow add: $reason: $arg (entries must be absolute paths, e.g. /home/you/bin/ask-codex.sh)"
+      fi
+      while IFS= read -r record; do
+        [ "$record" = "$entry" ] && found=1
+      done < <(_local_allow_entries)
+      if [ "$found" -eq 1 ]; then
+        _say_ok "already allowed: $entry"
+        return 0
+      fi
+      mkdir -p "$RAH_CONFIG_DIR" || _die "cannot create $RAH_CONFIG_DIR"
+      # Never glue the new entry onto a last line that lacks its newline.
+      if [ -s "$RAH_LOCAL_ALLOW_FILE" ]; then
+        existing=""
+        IFS= read -r -d '' existing < "$RAH_LOCAL_ALLOW_FILE" 2>/dev/null || true
+        case "$existing" in
+          ''|*$'\n') ;;
+          *) printf '\n' >> "$RAH_LOCAL_ALLOW_FILE" || _die "cannot write $RAH_LOCAL_ALLOW_FILE" ;;
+        esac
+      fi
+      printf '%s\n' "$entry" >> "$RAH_LOCAL_ALLOW_FILE" || _die "cannot write $RAH_LOCAL_ALLOW_FILE"
+      _say_ok "allowed locally: $entry"
+      [ -e "$entry" ] || _say_warn "no such file on this host (added anyway — the tool may not be installed yet)"
+      _say_note "$RAH_LOCAL_ALLOW_FILE"
+      ;;
+    remove|rm)
+      [ -n "$arg" ] || _die "usage: rah local-allow remove <absolute-path>"
+      entry="$(_trim_ws "$arg")"
+      if [ ! -f "$RAH_LOCAL_ALLOW_FILE" ]; then
+        _say_note "no local allow list: $RAH_LOCAL_ALLOW_FILE"
+        return 0
+      fi
+      tmp="$RAH_LOCAL_ALLOW_FILE.tmp.$$"
+      : > "$tmp" || _die "cannot write $tmp"
+      while IFS= read -r record || [ -n "$record" ]; do
+        if [ "$(_trim_ws "$record")" = "$entry" ]; then
+          found=1
+          continue
+        fi
+        printf '%s\n' "$record" >> "$tmp"
+      done < "$RAH_LOCAL_ALLOW_FILE"
+      if [ "$found" -eq 1 ]; then
+        mv "$tmp" "$RAH_LOCAL_ALLOW_FILE" || { rm -f "$tmp"; _die "cannot update $RAH_LOCAL_ALLOW_FILE"; }
+        _say_ok "removed: $entry"
+      else
+        rm -f "$tmp"
+        _say_note "not in the list: $entry"
+      fi
+      ;;
+    *)
+      _die "usage: rah local-allow list | add <absolute-path> | remove <absolute-path>"
       ;;
   esac
 }
@@ -1977,6 +2211,7 @@ _exec_plane_ok() {
 
 cmd_status() {
   local scope="all" target="" show_agents=1 configs=() any=0 cfg name host remote_path mp socket state mode port current_cfg="" mount_header=""
+  local allow_entry allow_any=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -a|--all) scope="all"; shift ;;
@@ -2049,6 +2284,15 @@ cmd_status() {
 
   _say_header "Autostart"
   _autostart_print_status || true
+
+  _say_header "Local allow (runs here, not on the remote)"
+  _say_note "$RAH_LOCAL_ALLOW_FILE"
+  while IFS= read -r allow_entry; do
+    [ -n "$allow_entry" ] || continue
+    allow_any=1
+    _say_cmd "$allow_entry"
+  done < <(_local_allow_entries)
+  [ "$allow_any" -eq 1 ] || _say_note "none"
 
   if [ "$show_agents" -eq 1 ]; then
     _say_header "Agents"
@@ -2266,6 +2510,7 @@ rah — Remote as Host (v$RAH_VERSION)
   rah hook [--decision defer|allow|ask] [--passthrough defer|empty]
                                                                 PreToolUse rewrite (reads JSON on stdin)
   rah hook-log on [path] | off | status | clear [path]       enable/inspect hook diagnostics
+  rah local-allow list | add <abs-path> | remove <abs-path>  keep tools at these absolute paths running locally
   rah init <claude|codex> [--remove]                         install/remove hook + skill for an agent
   rah status [--all|--current] [name|path] | list            show mount / ssh / exec / agent-hook health
   rah verify [name|path]                                     end-to-end mount/ssh/hook check
@@ -2288,6 +2533,7 @@ main() {
     run)         cmd_run "$@" ;;
     hook)        cmd_hook "$@" ;;
     hook-log)    cmd_hook_log "$@" ;;
+    local-allow) cmd_local_allow "$@" ;;
     init)        cmd_init "$@" ;;
     status|list) cmd_status "$@" ;;
     verify)      cmd_verify "$@" ;;
