@@ -231,6 +231,7 @@ On macOS, the first mount may require approving the macFUSE system extension in 
 |---|---|
 | `rah autostart on\|off\|status` | Restore managed mounts after login or reboot. / 在登录或重启后恢复受管理的挂载。 |
 | `rah hook-log on\|off\|status\|clear` | Inspect hook routing decisions. / 查看 hook 的路由决策。 |
+| `rah local-allow list\|add\|remove <absolute-path>` | Keep specific local tools running on the agent host. / 让指定的本地工具仍在 agent 主机上执行。 |
 | `rah self-update` | Fetch the latest Rah script. / 获取最新 Rah 脚本。 |
 | `rah uninstall [--purge]` | Remove Rah hooks, skills, binary, and optionally configuration. / 移除 Rah hook、skill、程序和可选的配置。 |
 
@@ -332,6 +333,22 @@ rah autostart status
 Linux uses `systemd --user`; macOS uses a LaunchAgent. Disable it with `rah autostart off`.
 
 Linux 使用 `systemd --user`，macOS 使用 LaunchAgent。可以用 `rah autostart off` 关闭。
+
+## Local allow list / 本地白名单
+
+Some tooling lives on the agent host, not on the remote — an `ask-codex.sh` wrapper, for example. Listing its absolute path keeps it running locally even inside a managed mount:
+
+有些工具只存在于 agent 主机而不在远端，例如 `ask-codex.sh` 包装脚本。把它的绝对路径加入白名单后，即使在受管理的挂载内也仍然在本地执行：
+
+```bash
+rah local-allow add /home/you/bin/ask-codex.sh
+rah local-allow list
+rah local-allow remove /home/you/bin/ask-codex.sh
+```
+
+The list is global (`~/.config/rah/local-allow`, one absolute path per line) because what it whitelists is the agent-side toolchain, not anything about a particular mount. A command matches only when it *starts* with a listed path and the path ends on a word boundary, so `echo /home/you/bin/ask-codex.sh` still runs on the remote. Relative paths, bare command names, and patterns are rejected by `rah local-allow add`. If the file is missing, unreadable, or malformed, commands route to the remote exactly as before — a broken whitelist can never widen local execution.
+
+白名单是全局的（`~/.config/rah/local-allow`，每行一条绝对路径），因为它放行的是 agent 侧工具链，与具体挂载无关。只有命令以白名单路径**开头**且该路径结束于词边界时才算命中，所以 `echo /home/you/bin/ask-codex.sh` 仍然在远端执行。`rah local-allow add` 会拒绝相对路径、裸命令名和通配符。当文件缺失、不可读或内容非法时，命令一律按原有行为转发到远端——白名单损坏时不会扩大本地执行范围。
 
 ## Hook diagnostics / Hook 诊断
 
