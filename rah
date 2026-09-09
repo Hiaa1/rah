@@ -833,7 +833,7 @@ _skill_doc() {
   cat <<'RAHSKILL'
 ---
 name: rah
-description: Remote as Host — manage the sshfs mount and remote execution for this machine. Use when the user asks to mount/unmount a remote project, set up "remote as host", check mount/ssh health (rah status), or recover a broken mount. Note that command execution in a rah-managed directory is ALREADY auto-routed to the remote by a hook — you do not need to add ssh yourself.
+description: Remote as Host — manage SSHFS mounts and command routing. Use for rah setup, mount health/recovery, or accessing the local host or another rah mount from a remote project. Normal commands inside a rah mount already run remotely; use rah local for explicit local execution.
 ---
 
 # rah — Remote as Host
@@ -846,8 +846,8 @@ already run on the remote (with its GPU, datasets, and environment).**
 
 ## When to use this skill
 
-Only for **control-plane** actions: setting up, mounting, checking health, or recovering.
-Execution routing is automatic; never wrap commands in ssh manually.
+Use for setting up, mounting, checking health, recovering, or choosing local execution
+and access to another mount. Normal remote execution is automatic; do not add SSH wrappers.
 
 ## Commands
 
@@ -857,6 +857,10 @@ Execution routing is automatic; never wrap commands in ssh manually.
   `~/path` is accepted for the remote path.
 - `rah status` / `rah list` — global status for all managed mounts by default; use
   `rah status --current` to show only the mount for the current directory.
+- `rah local [--cwd DIR] -- <command> [args...]` — execute once on the local agent host,
+  even inside a managed mount. No whitelist change is needed.
+- `rah run --cwd <local-mount-path> -- <command...>` — explicitly execute on that mount's
+  remote, including a different mount from the current project.
 - `rah mount [--name N] [--port PORT] [--prelude 'CMD'] user@host:/path [local-path]` — mount a remote
   code tree at a local directory. If no local path is given, rah uses
   `~/mnt_rah/<project>`. Use `.` for the current directory, or `--same-path` when
@@ -875,6 +879,41 @@ Execution routing is automatic; never wrap commands in ssh manually.
   *starts* with a listed path, so `echo /path/tool.sh` still goes remote. Entries must be absolute
   paths: relative paths, bare command names and patterns are rejected. Everything else — including
   a missing or malformed list — routes to the remote as usual.
+
+## Local files and other mounts
+
+Suppose the agent runs on A, with B and C mounted at `/mnt/b` and `/mnt/c`, and the
+current project is `/mnt/b`. Replace these example paths with paths from `rah list`.
+
+- Ordinary commands run on B. `cat /mnt/c/file.txt` still goes to B: paths in command
+  arguments do not select the execution host.
+- Use `rah local` to execute on A and read A's own files or either SSHFS mount:
+
+  ```bash
+  rah local -- cat /home/user/notes.txt
+  rah local -- cat /mnt/c/file.txt
+  rah local -- diff /mnt/b/config.yaml /mnt/c/config.yaml
+  ```
+
+- Use `rah run --cwd /mnt/c -- cat file.txt` to execute on C via SSH from A.
+  B does not need connectivity to C. `--cwd` is the mount path on A, not C's native path.
+
+The hook leaves commands starting with `rah` on A; `rah local` runs the given program
+there, while `rah run` connects to the selected remote. Put `rah local` at the start
+of the tool command. It preserves arguments, stdin, output, exit status, and the local
+working directory; `--cwd` changes that directory for this invocation only. If the
+current directory is `/mnt/b`, relative paths still refer to B's SSHFS files on A.
+Use absolute paths or `--cwd` to choose another location.
+
+For pipelines, redirects, or multiple commands, pass the whole script to a local shell:
+
+```bash
+rah local --cwd /home/user -- bash -c 'cat notes.txt | head -n 20'
+```
+
+Prefer `rah local` for occasional local access. Reserve `local-allow` for tools that
+should persistently run on A; it is a global executable whitelist, not a directory
+access list. `rah run` does not accept an unmanaged local directory as a local fallback.
 
 ## Recovery
 
@@ -903,7 +942,8 @@ Put HostName/Port/ProxyJump in `~/.ssh/config` under `Host <alias>`, then run
   natively when commands execute there. Don't try to read large datasets through the mount.
 - If a command must inspect remote outputs/logs, just run `cat`/`ls`/`tail` normally — it
   executes on the remote.
-- `cd` within the mount works locally and is preserved across commands; everything else runs remote.
+- Standalone `cd`/`pushd`/`popd` stays local. Other ordinary commands default to the
+  current mount's remote, with the explicit routing exceptions described above.
 RAHSKILL
 }
 
@@ -1221,6 +1261,30 @@ cmd_remove() {
       _say_warn "kept local directory (not empty): $mp"
     fi
   fi
+}
+
+# ---------- local (explicit one-command escape from remote routing) ----------
+
+cmd_local() {
+  local cwd=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd)
+        [ $# -ge 2 ] && [ -n "$2" ] || _die "local: --cwd requires a directory"
+        cwd="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) _die "usage: rah local [--cwd DIR] -- <command> [args...]" ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || _die "local: empty command (usage: rah local [--cwd DIR] -- <command> [args...])"
+  if [ -n "$cwd" ]; then
+    cwd="$(_expand_local_path "$cwd")"
+    cd -- "$cwd" || _die "local: cannot enter directory: $cwd"
+  fi
+  # Execute argv directly: do not reparse quotes or translate mount paths.
+  # Use an explicit shell (e.g. bash -c '...') when shell syntax is needed.
+  exec -- "$@"
 }
 
 # ---------- run (routing core) ----------
@@ -2506,6 +2570,7 @@ rah — Remote as Host (v$RAH_VERSION)
   rah unmount <name|path>                                    unmount + drop ssh master, keep config
   rah remove [--keep-local] [name|path]                      unmount + remove config; rmdir empty mountpoint
   rah autostart on|off|status                                restore managed mounts after reboot/login
+  rah local [--cwd DIR] -- <command> [args...]                execute once on the local agent host
   rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
   rah hook [--decision defer|allow|ask] [--passthrough defer|empty]
                                                                 PreToolUse rewrite (reads JSON on stdin)
@@ -2530,6 +2595,7 @@ main() {
     unmount)     cmd_unmount "$@" ;;
     remove|rm)   cmd_remove "$@" ;;
     autostart)   cmd_autostart "$@" ;;
+    local)       cmd_local "$@" ;;
     run)         cmd_run "$@" ;;
     hook)        cmd_hook "$@" ;;
     hook-log)    cmd_hook_log "$@" ;;
