@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">rah — Remote as Host</title>
+  <desc id="desc">One agent. Your compute. A local coding agent connects to GPU, CPU and lab hosts over SSH.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="360" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111827"/><stop offset="1" stop-color="#080D15"/>
+    </linearGradient>
+    <linearGradient id="lane" x1="830" y1="180" x2="1054" y2="180" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5EEAD4"/><stop offset="1" stop-color="#60A5FA"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" stroke="#CBD5E1" stroke-opacity="0.035"/>
+    </pattern>
+  </defs>
+  <rect x="1" y="1" width="1198" height="358" rx="18" fill="url(#bg)" stroke="#263244"/>
+  <rect x="650" y="24" width="526" height="312" rx="12" fill="url(#grid)"/>
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+    <path d="M54 53L67 64L54 75M78 76H99" stroke="#5EEAD4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="116" y="78" fill="#F8FAFC" font-size="42" font-weight="700" letter-spacing="-2">rah</text>
+    <path d="M203 51V78" stroke="#334155"/>
+    <text x="226" y="69" fill="#94A3B8" font-size="12" font-weight="600" letter-spacing="2.2">REMOTE AS HOST</text>
+    <text x="52" y="166" fill="#F8FAFC" font-size="44" font-weight="650" letter-spacing="-1.5">One agent. Your compute.</text>
+    <text x="54" y="204" fill="#A7B4C7" font-size="18">Local workflow. Remote execution. Connected by SSH.</text>
+    <path d="M54 251H578" stroke="#263244"/>
+    <circle cx="59" cy="286" r="4" fill="#5EEAD4"/>
+    <text x="74" y="291" fill="#B8C5D6" font-size="12" font-weight="500" letter-spacing="1">CLAUDE CODE</text>
+    <circle cx="222" cy="286" r="4" fill="#60A5FA"/>
+    <text x="237" y="291" fill="#B8C5D6" font-size="12" font-weight="500" letter-spacing="1">CODEX</text>
+    <text x="366" y="291" fill="#71849C" font-size="12" letter-spacing="0.5">Linux + macOS</text>
+
+    <path d="M834 180H881C913 180 902 90 940 90H1045M834 180H1045M834 180H881C913 180 902 270 940 270H1045" stroke="#26394C" stroke-width="2"/>
+    <path d="M834 180H881C913 180 902 90 940 90H1045M834 180H1045M834 180H881C913 180 902 270 940 270H1045" stroke="url(#lane)" stroke-opacity="0.75" stroke-width="1.5"/>
+    <circle cx="923" cy="105" r="4" fill="#5EEAD4"/>
+    <circle cx="965" cy="180" r="4" fill="#60A5FA"/>
+    <circle cx="993" cy="270" r="4" fill="#60A5FA"/>
+    <rect x="688" y="129" width="146" height="102" rx="14" fill="#131F2D" stroke="#426572"/>
+    <path d="M740 152L750 161L740 170M758 170H776" stroke="#5EEAD4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="761" y="202" text-anchor="middle" fill="#E2E8F0" font-size="15" font-weight="600">your agent</text>
+    <text x="761" y="257" text-anchor="middle" fill="#71849C" font-size="11" letter-spacing="1.4">ONE ENVIRONMENT</text>
+
+    <rect x="1045" y="62" width="99" height="56" rx="10" fill="#101A28" stroke="#33465C"/>
+    <text x="1095" y="95" text-anchor="middle" fill="#D2DFED" font-size="14" font-weight="600">GPU</text>
+    <rect x="1045" y="152" width="99" height="56" rx="10" fill="#101A28" stroke="#33465C"/>
+    <text x="1095" y="185" text-anchor="middle" fill="#D2DFED" font-size="14" font-weight="600">CPU</text>
+    <rect x="1045" y="242" width="99" height="56" rx="10" fill="#101A28" stroke="#33465C"/>
+    <text x="1095" y="275" text-anchor="middle" fill="#D2DFED" font-size="14" font-weight="600">LAB</text>
+  </g>
+</svg>
