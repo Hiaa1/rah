@@ -97,13 +97,22 @@ _trim_ws() {
 _timeout() {
   local seconds="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
+    timeout -k 1 "$seconds" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$seconds" "$@"
+    gtimeout -k 1 "$seconds" "$@"
   elif command -v perl >/dev/null 2>&1; then
-    perl -e 'my $seconds = shift @ARGV; alarm $seconds; exec @ARGV or die "exec: $!\n"' "$seconds" "$@"
+    perl -MPOSIX=:sys_wait_h -e '
+      my $seconds = shift @ARGV;
+      my $pid = fork(); defined $pid or die "fork: $!";
+      if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127; }
+      $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 1;
+                         kill "KILL", -$pid; exit 124; };
+      alarm $seconds; waitpid($pid, 0); alarm 0;
+      exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
+    ' "$seconds" "$@"
   else
-    "$@"
+    echo "rah: a bounded operation requires timeout, gtimeout or perl" >&2
+    return 1
   fi
 }
 
@@ -135,7 +144,15 @@ _file_recent() {
 
 _is_mountpoint() {
   local mp="$1"
-  if command -v mountpoint >/dev/null 2>&1; then
+  # Never stat a FUSE path merely to discover whether it is mounted. Even
+  # mountpoint(1) can block or report false on a disconnected endpoint.
+  if [ -r /proc/self/mountinfo ]; then
+    RAH_PROBE_MP="$mp" awk '
+      { p=$5; gsub(/\\040/, " ", p); gsub(/\\011/, "\t", p);
+        gsub(/\\012/, "\n", p); gsub(/\\134/, "\\", p);
+        if (p == ENVIRON["RAH_PROBE_MP"]) found=1 }
+      END {exit found ? 0 : 1}' /proc/self/mountinfo
+  elif command -v mountpoint >/dev/null 2>&1; then
     _timeout 3 mountpoint -q "$mp" 2>/dev/null
   else
     mount | awk -v mp="$mp" 'index($0, " on " mp " (") > 0 {found=1} END {exit found ? 0 : 1}'
@@ -145,13 +162,13 @@ _is_mountpoint() {
 _unmount_fuse() {
   local mp="$1"
   if command -v fusermount3 >/dev/null 2>&1; then
-    fusermount3 -uz "$mp"
+    _timeout 5 fusermount3 -uz "$mp"
   elif command -v fusermount >/dev/null 2>&1; then
-    fusermount -uz "$mp"
+    _timeout 5 fusermount -uz "$mp"
   elif _is_macos; then
-    diskutil unmount force "$mp" >/dev/null 2>&1 || umount -f "$mp"
+    _timeout 5 diskutil unmount force "$mp" >/dev/null 2>&1 || _timeout 5 umount -f "$mp"
   else
-    umount -l "$mp"
+    _timeout 5 umount -l "$mp"
   fi
 }
 
@@ -288,7 +305,7 @@ _install_missing_deps() {
 _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 _unit_quote() {
-  printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"
 }
 
 _xml_escape() {
@@ -417,7 +434,7 @@ _resolve_remote_path() {
 
 _prepare_mountpoint() {
   local mp="$1" allow_sudo="${2:-0}" first=""
-  if ! mkdir -p "$mp" 2>/dev/null; then
+  if ! _timeout 5 mkdir -p "$mp" 2>/dev/null; then
     if [ "$allow_sudo" = 1 ] && _confirm "local mount path $mp needs root to create once — do it with sudo?"; then
       sudo mkdir -p "$mp" && sudo chown "$USER": "$mp" || return 1
     else
@@ -426,9 +443,9 @@ _prepare_mountpoint() {
       return 1
     fi
   fi
-  mp="$(cd -P "$mp" && pwd -P)" || return 1
+  mp="$(_timeout 5 bash -c 'cd -P -- "$1" && pwd -P' bash "$mp")" || return 1
   if ! _is_mountpoint "$mp"; then
-    first="$(find "$mp" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | head -n 1 || true)"
+    first="$(_timeout 5 find "$mp" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" || return 1
     if [ -n "$first" ]; then
       echo "rah: local mountpoint is not empty: $mp" >&2
       echo "  choose an empty directory, or pass another local path." >&2
@@ -542,9 +559,15 @@ _is_rah_control_command() {
   return 1
 }
 
-# Fast, timeout-guarded liveness probe. A dead fuse mount hangs on access, so this
-# must never run unguarded. Returns 0 if the path is reachable.
-_mount_alive() { _timeout 2 stat "$1" >/dev/null 2>&1; }
+# A unique lookup forces an actual FUSE/SFTP request, unlike stat of the root
+# inode, which may be cached even while the connection is wedged. ENOENT is a
+# successful server response; all other errors (including timeout) are unhealthy.
+_mount_alive() {
+  local out probe="$1/.rah-health-$$-$RANDOM-$(date +%s)"
+  if out="$(LC_ALL=C _timeout 3 stat "$probe" 2>&1)"; then return 0; fi
+  case "$out" in *'No such file or directory'*) return 0 ;; esac
+  return 1
+}
 
 # Classify a mountpoint: mounted | dead | unmounted. `mountpoint -q` alone lies
 # (a dead fuse mount still reports as mounted), so combine it with a liveness probe.
@@ -552,10 +575,8 @@ _mount_state() {
   local mp="$1"
   if _is_mountpoint "$mp"; then
     _mount_alive "$mp" && echo mounted || echo dead
-  elif _timeout 3 stat "$mp" >/dev/null 2>&1; then
-    echo unmounted
   else
-    echo dead
+    echo unmounted
   fi
 }
 
@@ -575,13 +596,13 @@ _wait_for_mount() {
 _ssh_ok() {
   local host="$1" port="${2:-}" ssh_args=()
   [ -n "$port" ] && ssh_args=(-p "$port")
-  ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>/dev/null
+  _timeout 8 ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>/dev/null
 }
 
 _ssh_failure_details() {
   local host="$1" port="${2:-}" out="" ssh_args=()
   [ -n "$port" ] && ssh_args=(-p "$port")
-  out="$(ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>&1 >/dev/null || true)"
+  out="$(_timeout 8 ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>&1 >/dev/null || true)"
   printf '%s\n' "$out" | sed '/^$/d' | head -n 3
 }
 
@@ -953,7 +974,7 @@ RAHSKILL
 _ensure_master() {
   local host="$1" socket="$2" port="${3:-}" ssh_args=() lock held=0 i rc=0 lock_mtime
   [ -n "$port" ] && ssh_args=(-p "$port")
-  ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && return 0
+  _timeout 3 ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && return 0
 
   # Creating the master is check-then-act, and ssh cannot adopt a socket path that
   # already exists: concurrent creators all miss the check, all run the create, and
@@ -974,8 +995,10 @@ _ensure_master() {
     sleep 0.5
   done
 
+  [ "$held" = 1 ] || return 1
+
   # Whoever held the lock may have created the master while we waited.
-  if ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null; then
+  if _timeout 3 ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null; then
     [ "$held" = 1 ] && rmdir "$lock" 2>/dev/null || true
     return 0
   fi
@@ -984,16 +1007,19 @@ _ensure_master() {
   # then prints "ControlSocket ... already exists, disabling multiplexing" and leaks
   # in exactly the same way, so drop the stale path before creating the master.
   if [ -e "$socket" ]; then
-    ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
+    _timeout 3 ssh "${ssh_args[@]}" -S "$socket" -O exit "$host" 2>/dev/null || true
     rm -f "$socket"
   fi
-  ssh "${ssh_args[@]}" -M -S "$socket" -o ControlPersist=600 -fN "$host" || rc=$?
+  _timeout 12 ssh "${ssh_args[@]}" -M -S "$socket" -o BatchMode=yes \
+    -o ConnectTimeout=8 -o ConnectionAttempts=1 -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=3 -o ControlPersist=600 -fN "$host" || rc=$?
   # With ControlPersist, -f returns as soon as the master is forked, before it has
   # bound the socket. Releasing the lock here would let the next caller's check miss
   # again and create a second master, so hold it until the socket actually answers.
   if [ "$rc" -eq 0 ]; then
-    for ((i = 0; i < 40; i++)); do
-      ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && break
+    rc=1
+    for ((i = 0; i < 10; i++)); do
+      _timeout 3 ssh "${ssh_args[@]}" -S "$socket" -O check "$host" 2>/dev/null && { rc=0; break; }
       sleep 0.25
     done
   fi
@@ -1001,13 +1027,7 @@ _ensure_master() {
   return "$rc"
 }
 
-_remote_uname() {
-  local host="$1" socket="$2" port="${3:-}" ssh_args=()
-  [ -n "$port" ] && ssh_args=(-p "$port")
-  ssh "${ssh_args[@]}" -S "$socket" "$host" 'uname -s 2>/dev/null || true' 2>/dev/null | head -n1
-}
-
-# Mount remote_path at mp. Re-establishes master, clears a stale mount,
+# Mount remote_path at mp. Uses an independent transport, clears a stale mount,
 # and skips work if already healthy. When foreground is set, replace the
 # current process with sshfs so a service manager can own its lifecycle.
 _do_mount() {
@@ -1015,23 +1035,29 @@ _do_mount() {
   [ -n "$port" ] && sshfs_args=(-p "$port")
   [ "$foreground" = 1 ] && foreground_args=(-f)
   sshfs_bin="$(_sshfs_bin)" || return 1
-  _ensure_master "$host" "$socket" "$port" || return 1
   if _is_mountpoint "$mp"; then
     _mount_alive "$mp" && return 0               # already mounted & healthy
     _unmount_fuse "$mp" 2>/dev/null || true      # stale -> clear before remount
   fi
-  opts="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,ControlPath=$socket"
+  # Give the file plane its own SSH transport. A multiplexed connection can
+  # inherit a master's stale session/keepalives and couples unrelated mounts.
+  opts="BatchMode=yes,ConnectTimeout=8,ConnectionAttempts=1,ServerAliveInterval=5,ServerAliveCountMax=3,follow_symlinks,ControlMaster=no,ControlPath=none"
+  # systemd owns reconnection: let sshfs exit on disconnect so pending I/O
+  # fails promptly and the service restarts. Manual/macOS mounts self-reconnect.
+  [ "$foreground" = 1 ] || opts="reconnect,$opts"
   _is_macos && opts="$opts,defer_permissions"
-  remote_os="$(_remote_uname "$host" "$socket" "$port")"
+  remote_os="$(_timeout 10 ssh "${sshfs_args[@]}" -o BatchMode=yes \
+    -o ConnectTimeout=5 -o ControlMaster=no -o ControlPath=none "$host" \
+    'uname -s' 2>/dev/null)" || return 1
   case "$remote_os" in
     Darwin) opts="$opts,sftp_server=/usr/libexec/sftp-server" ;;
   esac
   if [ "$foreground" = 1 ]; then
     exec "$sshfs_bin" "${foreground_args[@]}" "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
-      -o "$opts"
+      -o "$opts" 8>&- 9>&-
   else
-    "$sshfs_bin" "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
-      -o "$opts"
+    _timeout 15 "$sshfs_bin" "${sshfs_args[@]}" "$host:$remote_path" "$mp" \
+      -o "$opts" 8>&- 9>&-
   fi
 }
 
@@ -1141,8 +1167,55 @@ cmd_mount() {
   _say_note "config: $cfg"
 }
 
+_remount_one() (
+  local name="$1" force="$2" cfg host remote_path mp socket port state
+  # Serialize manual remount and hook recovery for this mount only. Closing the
+  # descriptor releases the lock even if the caller is killed; no stale lockdirs.
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$RAH_CONFIG_DIR/.remount-lock.$name"
+    flock -w 2 8 || { echo "rah: recovery already in progress for $name" >&2; return 1; }
+  fi
+  cfg="$RAH_CONFIG_DIR/$name.env"
+  [ -f "$cfg" ] || { echo "rah: no such mount: $name" >&2; return 1; }
+  host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
+  mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
+  state="$(_mount_state "$mp")"
+  if [ "$force" -eq 0 ] && [ "$state" = mounted ]; then
+    _say_ok "already mounted $name"
+    _say_note "local: $mp"
+    return 0
+  fi
+  if _systemd_mount_service_enabled "$name"; then
+    if _systemd_restart_mount_service "$name" && _wait_for_mount "$mp"; then
+      _say_ok "remounted $name"
+      _say_note "local: $mp"
+    else
+      echo "rah: remount failed for $name" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$state" = dead ] || { [ "$force" -eq 1 ] && [ "$state" = mounted ]; }; then
+    _unmount_fuse "$mp" 2>/dev/null || return 1
+  fi
+  if [ "$state" != mounted ] || [ "$force" -eq 1 ]; then
+    local original_mp="$mp"
+    if ! mp="$(_prepare_mountpoint "$mp" 0)"; then
+      echo "rah: mountpoint not ready for $name: $original_mp" >&2
+      return 1
+    fi
+  fi
+  if _do_mount "$host" "$remote_path" "$mp" "$socket" "$port" && _wait_for_mount "$mp"; then
+    _say_ok "remounted $name"
+    _say_note "local: $mp"
+  else
+    echo "rah: remount failed for $name" >&2
+    return 1
+  fi
+)
+
 cmd_remount() {
-  local names=() cfg name host remote_path mp socket port arg force=0 best_effort=0 state failed=0
+  local names=() cfg name arg force=0 best_effort=0 failed=0
   if [ $# -gt 0 ]; then
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -1164,44 +1237,7 @@ cmd_remount() {
   fi
   [ "${#names[@]}" -gt 0 ] || _die "no managed mounts to remount"
   for name in "${names[@]}"; do
-    cfg="$RAH_CONFIG_DIR/$name.env"
-    [ -f "$cfg" ] || { echo "rah: no such mount: $name" >&2; failed=1; continue; }
-    host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
-    mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
-    state="$(_mount_state "$mp")"
-    if [ "$force" -eq 0 ] && [ "$state" = mounted ]; then
-      _say_ok "already mounted $name"
-      _say_note "local: $mp"
-      continue
-    fi
-    if _systemd_mount_service_enabled "$name"; then
-      if _systemd_restart_mount_service "$name" && _wait_for_mount "$mp"; then
-        _say_ok "remounted $name"
-        _say_note "local: $mp"
-      else
-        echo "rah: remount failed for $name" >&2
-        failed=1
-      fi
-      continue
-    fi
-    if [ "$state" = unmounted ]; then
-      local original_mp="$mp"
-      if ! mp="$(_prepare_mountpoint "$mp" 0)"; then
-        echo "rah: mountpoint not ready for $name: $original_mp" >&2
-        failed=1
-        continue
-      fi
-    fi
-    if [ "$force" -eq 1 ] || [ "$state" = dead ]; then
-      _unmount_fuse "$mp" 2>/dev/null || true
-    fi
-    if _do_mount "$host" "$remote_path" "$mp" "$socket" "$port" && _wait_for_mount "$mp"; then
-      _say_ok "remounted $name"
-      _say_note "local: $mp"
-    else
-      echo "rah: remount failed for $name" >&2
-      failed=1
-    fi
+    _remount_one "$name" "$force" || failed=1
   done
   [ "$best_effort" -eq 1 ] && return 0
   return "$failed"
@@ -1333,7 +1369,7 @@ cmd_run() {
 
   local remote="cd $(_shq "$remote_cwd") && ${pre}printf %s $(_shq "$b64") | base64 -d | bash"
   set +e
-  ssh "${ssh_args[@]}" -S "$socket" "$host" "$remote"
+  ssh "${ssh_args[@]}" -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -S "$socket" "$host" "$remote"
   local rc=$?
   set -e
   exit $rc
@@ -1386,17 +1422,16 @@ cmd_hook() {
   # Runs at most once per 10s; if the mount is dead or unmounted, fire a detached
   # remount and continue — the command still routes over ssh, independent of files.
   if [ -n "$cfg" ]; then
-    local _name _stamp _mp
+    local _name _stamp
     _name="$(basename "$cfg" .env)"; _stamp="$RAH_CONFIG_DIR/.heal.$_name"
     if ! _file_recent "$_stamp" 10; then
       : > "$_stamp" 2>/dev/null || true
-      _mp="$(_get "$cfg" mountpoint)"
-      if [ "$(_mount_state "$_mp")" != mounted ]; then
-        if command -v setsid >/dev/null 2>&1; then
-          setsid "$(_self_path)" remount "$_name" </dev/null >/dev/null 2>&1 &
-        else
-          nohup "$(_self_path)" remount "$_name" </dev/null >/dev/null 2>&1 &
-        fi
+      # The probe itself must also be detached: a frozen mount must never
+      # delay a tool hook, editor startup, or command-plane execution.
+      if command -v setsid >/dev/null 2>&1; then
+        setsid "$(_self_path)" _heal "$_name" </dev/null >/dev/null 2>&1 &
+      else
+        nohup "$(_self_path)" _heal "$_name" </dev/null >/dev/null 2>&1 &
       fi
     fi
   fi
@@ -1583,6 +1618,8 @@ _autostart_interval() { printf '%s\n' "${RAH_AUTOSTART_INTERVAL:-300}"; }
 
 _systemd_user_dir() { printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 _systemd_mount_template_path() { printf '%s/rah-mount@.service\n' "$(_systemd_user_dir)"; }
+_systemd_health_service_path() { printf '%s/rah-health@.service\n' "$(_systemd_user_dir)"; }
+_systemd_health_timer_path() { printf '%s/rah-health@.timer\n' "$(_systemd_user_dir)"; }
 _systemd_legacy_service_path() { printf '%s/rah-remount.service\n' "$(_systemd_user_dir)"; }
 _systemd_legacy_timer_path() { printf '%s/rah-remount.timer\n' "$(_systemd_user_dir)"; }
 
@@ -1610,9 +1647,11 @@ _systemd_mount_service_enabled() {
 }
 
 _systemd_enable_mount_service() {
-  local unit
+  local unit timer
   _systemd_user_ready || return 1
   unit="$(_systemd_mount_unit_name "$1")" || return 1
+  timer="${unit/rah-mount@/rah-health@}"; timer="${timer%.service}.timer"
+  systemctl --user enable --now "$timer" || return 1
   systemctl --user enable --now "$unit"
 }
 
@@ -1632,11 +1671,44 @@ _systemd_stop_mount_service() {
 }
 
 _systemd_disable_mount_service() {
-  local unit
+  local unit timer
   _is_macos && return 0
   _systemd_user_ready || return 0
   unit="$(_systemd_mount_unit_name "$1")" || return 0
+  timer="${unit/rah-mount@/rah-health@}"; timer="${timer%.service}.timer"
+  systemctl --user disable --now "$timer" >/dev/null 2>&1 || true
   systemctl --user disable "$unit" >/dev/null 2>&1 || true
+}
+
+# Hook recovery has no filesystem work in the calling process. Linux services
+# have their own independent timer; do not resurrect an explicitly stopped unit.
+cmd_heal() (
+  local name="${1:-}"
+  [ -n "$name" ] && [ -f "$RAH_CONFIG_DIR/$name.env" ] || return 0
+  _systemd_mount_service_enabled "$name" && return 0
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$RAH_CONFIG_DIR/.heal-lock.$name"
+    flock -n 9 || return 0
+  fi
+  cd / || return 1
+  cmd_remount "$name"
+)
+
+# Each mount is checked independently. Only a running service is eligible:
+# startup/retry already belongs to systemd, and manual stop must stay stopped.
+cmd_systemd_health() {
+  local name="${1:-}" cfg unit mp
+  [ -n "$name" ] || return 1
+  cfg="$RAH_CONFIG_DIR/$name.env"
+  [ -f "$cfg" ] || return 0
+  unit="$(_systemd_mount_unit_name "$name")" || return 1
+  [ "$(systemctl --user show -p ActiveState --value "$unit")" = active ] || return 0
+  mp="$(_get "$cfg" mountpoint)"
+  [ "$(_mount_state "$mp")" != mounted ] || return 0
+  # Recheck after the probe so a stop/start during that probe is respected.
+  [ "$(systemctl --user show -p ActiveState --value "$unit")" = active ] || return 0
+  echo "rah: unhealthy mount $name ($mp); restarting its service" >&2
+  systemctl --user --no-block try-restart "$unit"
 }
 
 # Commands used by the generated systemd template. Keep sshfs in the foreground
@@ -1646,7 +1718,7 @@ cmd_systemd_mount() {
   local name="${1:-}" cfg host remote_path mp socket port state
   [ -n "$name" ] || _die "internal: missing systemd mount name"
   cfg="$RAH_CONFIG_DIR/$name.env"
-  [ -f "$cfg" ] || return 0
+  [ -f "$cfg" ] || return 78
   host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
   mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
   state="$(_mount_state "$mp")"
@@ -1674,15 +1746,14 @@ cmd_systemd_check() {
 }
 
 cmd_systemd_unmount() {
-  local name="${1:-}" cfg mp state
+  local name="${1:-}" cfg mp
   [ -n "$name" ] || return 0
   cfg="$RAH_CONFIG_DIR/$name.env"
   [ -f "$cfg" ] || return 0
   mp="$(_get "$cfg" mountpoint)"
-  state="$(_mount_state "$mp")"
-  case "$state" in
-    mounted|dead) _unmount_fuse "$mp" >/dev/null 2>&1 || true ;;
-  esac
+  # Cleanup must never wait for the failed filesystem to answer.
+  if _is_mountpoint "$mp"; then _unmount_fuse "$mp"; fi
+  return 0
 }
 
 _launchd_label() { printf 'dev.rah.remount\n'; }
@@ -1711,20 +1782,50 @@ Description=Keep RAH mount %I available
 Documentation=https://github.com/$RAH_REPO
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+WorkingDirectory=/
 Environment=PATH=$RAH_BIN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=$(_unit_quote "RAH_CONFIG_DIR=$RAH_CONFIG_DIR")
 ExecStart=$(_unit_quote "$rah_bin") _systemd-mount %I
 ExecStartPost=$(_unit_quote "$rah_bin") _systemd-check %I
 ExecStop=$(_unit_quote "$rah_bin") _systemd-unmount %I
-Restart=on-failure
-RestartSec=15s
+ExecStopPost=$(_unit_quote "$rah_bin") _systemd-unmount %I
+Restart=always
+RestartPreventExitStatus=78
+RestartSec=30s
 TimeoutStartSec=30s
 TimeoutStopSec=20s
 
 [Install]
 WantedBy=default.target
+EOF
+  cat > "$(_systemd_health_service_path)" <<EOF
+[Unit]
+Description=Check RAH mount %I responsiveness
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PATH=$RAH_BIN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=$(_unit_quote "RAH_CONFIG_DIR=$RAH_CONFIG_DIR")
+ExecStart=$(_unit_quote "$rah_bin") _systemd-health %I
+TimeoutStartSec=12s
+TimeoutStopSec=2s
+EOF
+  cat > "$(_systemd_health_timer_path)" <<EOF
+[Unit]
+Description=Periodically check RAH mount %I
+
+[Timer]
+OnStartupSec=15s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
 EOF
 }
 
@@ -1754,7 +1855,7 @@ _autostart_ssh_agent_preflight() {
     case "$seen" in *" $host|$port "*) continue ;; esac
     seen="$seen$host|$port "
     ssh_args=(); [ -n "$port" ] && ssh_args=(-p "$port")
-    SSH_AUTH_SOCK="" ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 \
+    SSH_AUTH_SOCK="" _timeout 8 ssh "${ssh_args[@]}" -o BatchMode=yes -o ConnectTimeout=5 \
       -o IdentityAgent=none "$host" true 2>/dev/null && continue
     # Agent-less auth failed. Only call that an autostart problem if the host is
     # otherwise reachable -- a host that is simply down fails this probe too, and
@@ -1776,6 +1877,7 @@ _autostart_enable_systemd() {
   if systemctl --user daemon-reload >/dev/null 2>&1; then
     _disable_legacy_systemd_autostart
     systemctl --user daemon-reload >/dev/null 2>&1 || true
+    _autostart_ssh_agent_preflight
     while IFS= read -r cfg; do
       [ -n "$cfg" ] || continue
       name="$(basename "$cfg" .env)"
@@ -1786,7 +1888,6 @@ _autostart_enable_systemd() {
         failed=1
       fi
     done < <(_list_configs)
-    _autostart_ssh_agent_preflight
     if [ "$enabled" -gt 0 ]; then
       _say_ok "automatic recovery enabled for $enabled mount(s)"
     else
@@ -1813,13 +1914,13 @@ _autostart_disable_systemd() {
     _systemd_disable_mount_service "$name"
   done < <(_list_configs)
   _disable_legacy_systemd_autostart
-  rm -f "$(_systemd_mount_template_path)"
+  rm -f "$(_systemd_mount_template_path)" "$(_systemd_health_service_path)" "$(_systemd_health_timer_path)"
   _systemd_user_ready && systemctl --user daemon-reload >/dev/null 2>&1 || true
   _say_ok "autostart disabled"
 }
 
 _autostart_status_systemd() {
-  local template cfg name unit enabled=0 active=0 total=0
+  local template cfg name unit timer snapshot units=() enabled=0 active=0 total=0 watched=0
   template="$(_systemd_mount_template_path)"
   printf '  %-10s systemd --user\n' "provider:"
   if [ -f "$template" ]; then
@@ -1829,20 +1930,43 @@ _autostart_status_systemd() {
     printf '  %-10s ' "files:"
     _tag_note "not installed"; printf ' run: rah autostart on\n'
   fi
-  if _systemd_user_ready; then
-    while IFS= read -r cfg; do
-      [ -n "$cfg" ] || continue
-      total=$((total + 1)); name="$(basename "$cfg" .env)"
-      unit="$(_systemd_mount_unit_name "$name" 2>/dev/null || true)"
-      [ -n "$unit" ] || continue
-      _systemd_mount_service_enabled "$name" && enabled=$((enabled + 1))
-      [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = active ] && active=$((active + 1))
-    done < <(_list_configs)
-    printf '  %-10s %s/%s enabled, %s active\n' "mounts:" "$enabled" "$total" "$active"
-  else
-    printf '  %-10s ' "mounts:"
-    _tag_warn "unavailable"; printf ' systemd --user is not reachable\n'
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    total=$((total + 1)); name="$(basename "$cfg" .env)"
+    unit="$(_systemd_mount_unit_name "$name" 2>/dev/null || true)"
+    [ -n "$unit" ] || continue
+    timer="${unit/rah-mount@/rah-health@}"; timer="${timer%.service}.timer"
+    units+=("$unit" "$timer")
+  done < <(_list_configs)
+  if [ "${#units[@]}" -gt 0 ]; then
+    # Query the user manager once, under one deadline. Repeated show-environment,
+    # is-enabled and is-active calls used to multiply a stalled bus's delay.
+    if ! snapshot="$(_timeout 3 systemctl --user show --property=Id \
+        --property=ActiveState --property=UnitFileState "${units[@]}" 2>/dev/null)"; then
+      printf '  %-10s ' "mounts:"
+      _tag_warn "unavailable"; printf ' systemd query failed or exceeded 3s\n'
+      return 0
+    fi
+    local key value id="" live="" state=""
+    while IFS='=' read -r key value; do
+      case "$key" in
+        Id) id="$value" ;;
+        ActiveState) live="$value" ;;
+        UnitFileState) state="$value" ;;
+        "")
+          case "$id" in
+            rah-mount@*.service)
+              case "$state" in enabled|enabled-runtime|linked|linked-runtime) enabled=$((enabled + 1)) ;; esac
+              [ "$live" != active ] || active=$((active + 1)) ;;
+            rah-health@*.timer)
+              [ "$live" != active ] || watched=$((watched + 1)) ;;
+          esac
+          id=""; live=""; state="" ;;
+      esac
+    done <<< "$snapshot"$'\n'
   fi
+  printf '  %-10s %s/%s enabled, %s active\n' "mounts:" "$enabled" "$total" "$active"
+  printf '  %-10s %s/%s timers active (15s interval)\n' "health:" "$watched" "$total"
 }
 
 _write_launchd_autostart() {
@@ -1928,7 +2052,7 @@ _autostart_status_launchd() {
     _tag_note "not installed"; printf ' run: rah autostart on\n'
   fi
   printf '  %-10s ' "agent:"
-  if launchctl print "$service" >/dev/null 2>&1; then
+  if _timeout 3 launchctl print "$service" >/dev/null 2>&1; then
     _tag_ok "loaded"; printf '\n'
   else
     _tag_warn "not loaded"; printf '\n'
@@ -2268,13 +2392,78 @@ _cfg_from_arg_or_cwd() {
   return 1
 }
 
-_exec_plane_ok() {
-  local mp="$1"
-  _timeout 15 "$(_self_path)" run --cwd "$mp" -- true >/dev/null 2>&1
+# One read-only SSH session checks transport and execution together. Do not
+# call `rah run`: its master creation, lock waits and retries are recovery work.
+_status_remote_probe() {
+  local cfg="$1" host port remote_path prelude pre="" out rc=0 b64 remote
+  local ssh_args=() token="rah-status-$$-$RANDOM" ssh_state=failed exec_state=skipped
+  host="$(_get "$cfg" host)"; port="$(_get "$cfg" ssh_port)"
+  remote_path="$(_get "$cfg" remote_path)"; prelude="$(_get "$cfg" prelude)"
+  [ -n "$port" ] && ssh_args=(-p "$port")
+  [ -z "$prelude" ] || pre="{ $prelude; } && "
+  b64="$(printf '%s' "printf '%s\n' $(_shq "$token-exec")" | _b64_encode)"
+  remote="printf '%s\\n' $(_shq "$token-ssh"); cd $(_shq "$remote_path") && ${pre}printf %s $(_shq "$b64") | base64 -d | bash"
+  # Fresh, non-multiplexed transport: no stale socket, no ControlPersist daemon,
+  # no authentication prompt. The outer deadline covers ProxyJump and commands.
+  out="$(_timeout 3 ssh "${ssh_args[@]}" -n -T -o BatchMode=yes \
+    -o ConnectTimeout=3 -o ConnectionAttempts=1 -o ControlMaster=no \
+    -o ControlPersist=no -o ControlPath=none "$host" "$remote" 2>/dev/null)" || rc=$?
+  if [[ "$out" == *"$token-ssh"* ]]; then
+    ssh_state=reachable; exec_state=failed
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"$token-exec"* ]]; then exec_state=ok; fi
+  fi
+  case "$rc" in
+    124|137)
+      if [ "$ssh_state" = reachable ]; then exec_state=timeout; else ssh_state=timeout; fi ;;
+  esac
+  printf '%s %s\n' "$ssh_state" "$exec_state"
 }
 
-cmd_status() {
-  local scope="all" target="" show_agents=1 configs=() any=0 cfg name host remote_path mp socket state mode port current_cfg="" mount_header=""
+_status_mount_report() {
+  local cfg="$1" current_cfg="$2" result="$3" name host remote_path mp port mode state ssh_state exec_state
+  local mount_pid remote_pid
+  name="$(basename "$cfg" .env)"
+  host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
+  mp="$(_get "$cfg" mountpoint)"; port="$(_get "$cfg" ssh_port)"
+  mode="$(_get "$cfg" mode)"; [ -n "$mode" ] || mode="same-path"
+  _mount_state "$mp" > "$result.mount" & mount_pid=$!
+  _status_remote_probe "$cfg" > "$result.remote" & remote_pid=$!
+  wait "$mount_pid" || true
+  wait "$remote_pid" || true
+  state="$(cat "$result.mount")"
+  ssh_state=failed; exec_state=skipped
+  read -r ssh_state exec_state < "$result.remote" || true
+  printf '%b\n' "${RAH_BOLD}$name${RAH_RESET}"
+  printf '  host:       %s\n' "$host"
+  [ -z "$port" ] || printf '  port:       %s\n' "$port"
+  printf '  remote:     %s\n' "$remote_path"
+  printf '  local:      %s [%s] ' "$mp" "$mode"
+  case "$state" in
+    mounted) _tag_ok "mounted"; printf '\n' ;;
+    dead) _tag_fail "DEAD"; printf ' unresponsive or failed; run: rah remount %s\n' "$name" ;;
+    unmounted) _tag_warn "not mounted"; printf '\n' ;;
+    *) _tag_warn "unknown"; printf '\n' ;;
+  esac
+  printf '  ssh:        '
+  case "$ssh_state" in
+    reachable) _tag_ok "reachable"; printf '\n' ;;
+    timeout) _tag_warn "TIMEOUT"; printf ' exceeded 3s\n' ;;
+    *) _tag_fail "FAILED"; printf ' run: ssh%s -o BatchMode=yes %s true\n' "${port:+ -p $port}" "$host" ;;
+  esac
+  printf '  exec:       '
+  case "$exec_state" in
+    ok) _tag_ok "remote ok"; printf '\n' ;;
+    skipped) _tag_note "not checked"; printf ' SSH unavailable\n' ;;
+    timeout) _tag_warn "TIMEOUT"; printf ' SSH connected; execution exceeded probe deadline\n' ;;
+    *) _tag_fail "FAILED"; printf ' run: rah verify %s\n' "$name" ;;
+  esac
+  if [ "$cfg" = "$current_cfg" ]; then printf '  current:    yes\n'; fi
+  return 0
+}
+
+cmd_status() (
+  local scope="all" target="" show_agents=1 configs=() any=0 cfg current_cfg="" mount_header=""
+  local results pids=() report=0 first=0 i pid autostart_pid
   local allow_entry allow_any=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -2319,35 +2508,31 @@ cmd_status() {
   fi
   _say_header "$mount_header"
   _say_note "config dir: $RAH_CONFIG_DIR"
+  results="$(mktemp -d "${TMPDIR:-/tmp}/rah-status.XXXXXXXX")" || return 1
+  trap 'rm -rf -- "$results"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  _autostart_print_status > "$results/autostart" 2>/dev/null & autostart_pid=$!
+  _say_note "checking up to 8 mounts in parallel; SSH deadline: 3s"
   for cfg in "${configs[@]}"; do
     any=1
-    name="$(basename "$cfg" .env)"
-    host="$(_get "$cfg" host)"; remote_path="$(_get "$cfg" remote_path)"
-    mp="$(_get "$cfg" mountpoint)"; socket="$(_get "$cfg" control_socket)"; port="$(_get "$cfg" ssh_port)"
-    mode="$(_get "$cfg" mode)"; [ -n "$mode" ] || mode="same-path"
-    printf '%b\n' "${RAH_BOLD}$name${RAH_RESET}"
-    printf '  host:       %s\n' "$host"
-    [ -n "$port" ] && printf '  port:       %s\n' "$port"
-    printf '  remote:     %s\n' "$remote_path"
-    printf '  local:      %s [%s] ' "$mp" "$mode"
-    state="$(_mount_state "$mp")"
-    case "$state" in
-      mounted) _tag_ok "mounted"; printf '\n' ;;
-      dead)    _tag_fail "DEAD"; printf ' run: rah remount %s\n' "$name" ;;
-      *)       _tag_warn "not mounted"; printf '\n' ;;
-    esac
-    printf '  ssh:        '
-    if _ssh_ok "$host" "$port"; then _tag_ok "reachable"; printf '\n'; else _tag_fail "FAILED"; printf ' run: ssh%s -o BatchMode=yes %s true\n' "${port:+ -p $port}" "$host"; fi
-    printf '  exec:       '
-    if _exec_plane_ok "$mp"; then _tag_ok "remote ok"; printf '\n'; else _tag_fail "FAILED"; printf ' run: rah verify %s\n' "$name"; fi
-    if [ "$cfg" = "$current_cfg" ]; then
-      printf '  current:    yes\n'
+    _status_mount_report "$cfg" "$current_cfg" "$results/$report" > "$results/$report.report" &
+    pids+=("$!"); report=$((report + 1))
+    # Keep a bound on simultaneous connections, including repeated mounts on
+    # one SSH server. Collect each batch in config order without mixed output.
+    if [ "${#pids[@]}" -eq 8 ]; then
+      for pid in "${pids[@]}"; do wait "$pid" || true; done
+      for ((i = first; i < report; i++)); do cat "$results/$i.report"; done
+      first="$report"; pids=()
     fi
   done
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+  for ((i = first; i < report; i++)); do cat "$results/$i.report"; done
   [ "$any" -eq 1 ] || [ "$scope" = current ] || _say_warn "no managed mounts; run: rah mount user@host:~/project"
 
   _say_header "Autostart"
-  _autostart_print_status || true
+  wait "$autostart_pid" || true
+  cat "$results/autostart"
 
   _say_header "Local allow (runs here, not on the remote)"
   _say_note "$RAH_LOCAL_ALLOW_FILE"
@@ -2369,7 +2554,7 @@ cmd_status() {
       printf '%b\n' "$(_tag_note "off")"
     fi
   fi
-}
+)
 
 cmd_verify() {
   local target="${1:-}" cfg name host remote_path mp port ok=1 out hook_out outside path_cmd path_b64
@@ -2606,6 +2791,8 @@ main() {
     doctor)      cmd_doctor "$@" ;;
     self-update) cmd_self_update "$@" ;;
     uninstall)   cmd_uninstall "$@" ;;
+    _heal)           cmd_heal "$@" ;;
+    _systemd-health)  cmd_systemd_health "$@" ;;
     _systemd-mount)   cmd_systemd_mount "$@" ;;
     _systemd-check)   cmd_systemd_check "$@" ;;
     _systemd-unmount) cmd_systemd_unmount "$@" ;;
