@@ -17,9 +17,11 @@
 | `rah remove [--keep-local] [name\|path]` | 移除挂载配置，默认还会删除空的本地挂载目录。 |
 | `rah autostart on\|off\|status` | 管理开机或登录后的自动恢复。 |
 | `rah local [--cwd DIR] -- <command> [args...]` | 在 agent 本机执行一条命令。 |
+| `rah remote [--cwd DIR] -- <command> [args...]` | 在当前挂载的远端执行一条命令，即使它在 `local-cmds` 里。 |
 | `rah run --cwd <local-mount-path> -- <command...>` | 在指定挂载对应的远端执行命令。 |
 | `rah init <claude\|codex> [--remove]` | 安装或移除路由 hook 和技能说明。 |
 | `rah local-allow list\|add\|remove <absolute-path>` | 管理本机可执行文件例外。 |
+| `rah local-cmds [--global\|--mount name\|path] [show\|set [CMD...]\|reset]` | 按程序名设置哪些命令在本机执行，可全局或按挂载设置，默认为空。 |
 | `rah hook-log on\|off\|status\|clear` | 管理路由决策日志。 |
 | `rah doctor` | 检查本地依赖和受管理的挂载。 |
 | `rah version` | 查看当前安装的程序版本。 |
@@ -165,7 +167,7 @@ rah local -- diff /mnt/b/config.yaml /mnt/c/config.yaml
 rah run --cwd /mnt/c -- cat file.txt
 ```
 
-Hook 将以 `rah` 开头的命令留在 A 执行，无需 B 能通过 SSH 连接 C。请让 `rah local` 位于 agent 工具命令的开头。
+Hook 将以 `rah` 开头的命令留在 A 执行，无需 B 能通过 SSH 连接 C。请让 `rah local` 位于 agent 工具命令的开头；`rah` 出现在命令中间（如 `ls; rah local -- ...`）时，整行本会被送到 B，hook 会直接拒绝并给出提示。
 
 `rah local` 保留参数、标准输入输出和退出码，工作目录也保留在本机。处于 `/mnt/b` 时，相对路径仍访问 B 的挂载文件；用 `--cwd` 或绝对路径选择其他目录。管道和重定向应整体交给本地 shell：
 
@@ -183,7 +185,36 @@ rah local-allow list
 rah local-allow remove /home/you/bin/local-helper.sh
 ```
 
-全局文件位于 `~/.config/rah/local-allow`，每行一条绝对路径。命令必须以条目开头，并在词边界结束匹配。`echo /home/you/bin/local-helper.sh` 仍会转发到远端。相对路径、裸命令名和模式匹配会被拒绝；条目缺失或非法不会扩大本地执行范围。
+全局文件位于 `~/.config/rah/local-allow`，每行一条绝对路径。命令的程序名（可以带引号和 `VAR=value` 前缀）与条目完全相同才算匹配。`echo /home/you/bin/local-helper.sh` 仍会转发到远端。相对路径、裸命令名和模式匹配会被拒绝；条目缺失或非法不会扩大本地执行范围。
+
+### 按命令名在本机执行
+
+有些工具不管打开哪个项目都应在 agent 本机运行：`gh` 要用你的 GitHub 登录，`codex` 这类 agent CLI 要用你自己的账号和配置，所以 `codex exec` 子 agent 应该在 A 启动，而不是在远端。命令的程序名在本机命令列表里，就在 A 执行。判断时跳过 `env` 和 `VAR=value` 前缀、去掉引号、只看文件名，所以 `"/任意路径/tool.sh" ...` 能匹配 `tool.sh`。列表默认为空，`--global` 为所有没单独设置的挂载统一设置。
+
+```bash
+rah local-cmds                 # 查看当前挂载的列表
+rah local-cmds --global set gh codex   # 所有挂载
+rah local-cmds set gh git      # 这个挂载的 git 也在 A 执行
+rah local-cmds set             # 全部转发到远端
+rah local-cmds --mount NAME reset   # 改回用全局列表
+```
+
+只想临时指定某一条命令在哪跑，就加前缀，不用改列表。两种写法都原样保留参数：
+
+```bash
+rah local -- git push          # 这次在 A 执行
+rah remote -- gh auth status   # 这次在远端执行，不管 local_cmds
+```
+
+列表存在挂载配置的 `local_cmds=` 里。`git` 一般留在远端更好：仓库钩子用远端环境，大仓库也不用走 SSHFS。列表里的命令出现在会被送到远端的命令行中间（如 `make && gh pr create`）时，hook 会拒绝这一行并说明怎么拆开，而不是让远端报 `command not found`。
+
+### 告诉 agent 命令在哪执行
+
+`rah init claude` 还会安装一个 `SessionStart` hook（`rah session-context`）。在受管理的挂载里，它会告诉 Claude：命令在哪台主机执行，远端路径怎样对应挂载路径，哪些命令留在本机，以及怎么用 `rah local`。Claude 自带的环境信息描述的是 agent 本机，没有这段提示时它常把远端路径直接交给文件工具。
+
+### 停止远端命令
+
+`rah run` 让远端命令在独立的进程组里运行。Agent 停止或杀掉一条被转发的命令时（向本地 `ssh` 发 SIGTERM），rah 会向整个远端进程组发信号，训练任务和它的 worker 不会在背后继续跑。SSH 连接中途断开（退出码 255）时，rah 会检查命令是否还活着；如果还在跑，就打印它的进程组和停止它的命令。
 
 ## 恢复与排障
 

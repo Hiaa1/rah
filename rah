@@ -19,6 +19,8 @@ RAH_CLAUDE_MATCHER="Bash|Monitor"
 # A whitelist is a handful of paths; anything larger is a corrupt or wrong file,
 # and scanning it would stall every Bash tool call.
 RAH_LOCAL_ALLOW_MAX_BYTES=65536
+# Global list of command names that run on the agent host (rah local-cmds --global).
+RAH_LOCAL_CMDS_FILE="$RAH_CONFIG_DIR/local-cmds"
 RAH_UNAME="$(uname -s 2>/dev/null || echo unknown)"
 
 _is_macos() { [ "$RAH_UNAME" = Darwin ]; }
@@ -537,28 +539,88 @@ _is_env_assignment_word() {
   esac
 }
 
-# True when a tool command is invoking rah itself. Control-plane rah commands must
-# stay local even when the agent cwd is inside a managed mount.
-_is_rah_control_command() {
-  local s word
+# Print the program word of a simple command, skipping `env`, `command` and
+# leading VAR=value assignments. A quoted program word ("/path/x.sh") is printed
+# without its quotes; agents quote plugin script paths.
+_command_head() {
+  local s word q
   s="$(_trim_leading_ws "$1")"
   while [ -n "$s" ]; do
+    q="${s:0:1}"
+    if [ "$q" = '"' ] || [ "$q" = "'" ]; then
+      word="${s:1}"
+      printf '%s\n' "${word%%"$q"*}"
+      return 0
+    fi
     word="${s%%[[:space:]]*}"
     if [ "$word" = "$s" ]; then
       s=""
     else
       s="$(_trim_leading_ws "${s#"$word"}")"
     fi
-    case "$word" in
-      env|command) continue ;;
-      rah|*/rah|./rah) return 0 ;;
-    esac
-    if _is_env_assignment_word "$word"; then
-      continue
-    fi
-    return 1
+    case "$word" in env|command) continue ;; esac
+    _is_env_assignment_word "$word" && continue
+    printf '%s\n' "$word"
+    return 0
   done
   return 1
+}
+
+# Program words of the second and later commands in a command line, split on
+# ; & | ( ) { } and newlines. Quotes are not parsed: this only has to spot
+# `make && gh pr create`, where the first word sends everything to the remote.
+_later_command_heads() {
+  local s="$1" seg first=1
+  s="${s//[;&|()\{\}]/$'\n'}"
+  while IFS= read -r seg; do
+    if [ "$first" -eq 1 ]; then first=0; continue; fi
+    _command_head "$seg" || true
+  done <<< "$s"
+}
+
+# True when a tool command is invoking rah itself. Control-plane rah commands must
+# stay local even when the agent cwd is inside a managed mount.
+_is_rah_control_command() {
+  local head
+  head="$(_command_head "$1")" || return 1
+  case "$head" in rah|*/rah) return 0 ;; esac
+  return 1
+}
+
+# Command names that run on this host for a mount: its local_cmds key, else the
+# global list from `rah local-cmds --global set`. Nothing is local by default.
+_local_cmds() {
+  if grep -q '^local_cmds=' "$1" 2>/dev/null; then
+    _get "$1" local_cmds
+  else
+    _global_local_cmds
+  fi
+}
+
+_global_local_cmds() {
+  [ -f "$RAH_LOCAL_CMDS_FILE" ] || return 0
+  tr '\n' ' ' < "$RAH_LOCAL_CMDS_FILE" | sed 's/ *$//'; printf '\n'
+}
+
+# True when program word $1 (bare or a path) names one of the commands in list $2.
+_is_local_cmd() {
+  local name="${1##*/}" c
+  for c in $2; do
+    [ "$c" = "$name" ] && return 0
+  done
+  return 1
+}
+
+_cfg_set() {
+  local file="$1" key="$2" value="$3" tmp="$1.tmp.$$"
+  { grep -v "^$key=" "$file" || true; printf '%s=%s\n' "$key" "$value"; } > "$tmp"
+  mv "$tmp" "$file"
+}
+
+_cfg_unset() {
+  local file="$1" key="$2" tmp="$1.tmp.$$"
+  { grep -v "^$key=" "$file" || true; } > "$tmp"
+  mv "$tmp" "$file"
 }
 
 # A unique lookup forces an actual FUSE/SFTP request, unlike stat of the root
@@ -813,23 +875,14 @@ _local_allow_entries() {
   done < <(_local_allow_scan)
 }
 
-# Print the whitelist entry that command $1 invokes, if any. The entry must sit at
-# the very start of the command (leading whitespace aside) and end on a boundary, so
-# /a/b/x.sh never matches /a/b/x.shX and `echo /a/b/x.sh` never matches at all.
+# Print the whitelist entry that command $1 invokes, if any: its program word
+# (see _command_head, so quotes and VAR=value prefixes are fine) must equal the
+# entry. /a/b/x.sh never matches /a/b/x.shX and `echo /a/b/x.sh` never matches.
 _local_allow_match() {
-  local cmd entry rest
-  cmd="$(_trim_leading_ws "$1")"
-  [ -n "$cmd" ] || return 1
+  local head entry
+  head="$(_command_head "$1")" || return 1
   while IFS= read -r entry; do
-    [ -n "$entry" ] || continue
-    case "$cmd" in
-      "$entry")  printf '%s\n' "$entry"; return 0 ;;
-      "$entry"*) rest="${cmd#"$entry"}" ;;
-      *)         continue ;;
-    esac
-    case "$rest" in
-      [[:space:]]*|\"*|\'*) printf '%s\n' "$entry"; return 0 ;;
-    esac
+    [ "$entry" = "$head" ] && { printf '%s\n' "$entry"; return 0; }
   done < <(_local_allow_entries)
   return 1
 }
@@ -882,6 +935,8 @@ and access to another mount. Normal remote execution is automatic; do not add SS
   `rah status --current` to show only the mount for the current directory.
 - `rah local [--cwd DIR] -- <command> [args...]` — execute once on the local agent host,
   even inside a managed mount. No whitelist change is needed.
+- `rah remote [--cwd DIR] -- <command> [args...]` — execute once on the current mount's remote,
+  overriding `local-cmds` (e.g. `rah remote -- gh auth status`). Arguments are kept as given.
 - `rah run --cwd <local-mount-path> -- <command...>` — explicitly execute on that mount's
   remote, including a different mount from the current project.
 - `rah mount [--name N] [--port PORT] [--prelude 'CMD'] user@host:/path [local-path]` — mount a remote
@@ -898,10 +953,20 @@ and access to another mount. Normal remote execution is automatic; do not add SS
 - `rah init <claude|codex>` — install the routing hook and this skill for an agent.
 - `rah local-allow list | add <absolute-path> | remove <absolute-path>` — a global whitelist of
   absolute paths that keep running **on this machine** even inside a mount (agent-side tools such
-  as `ask-codex.sh`, which exist here and not on the remote). A command matches only when it
-  *starts* with a listed path, so `echo /path/tool.sh` still goes remote. Entries must be absolute
+  as `ask-codex.sh`, which exist here and not on the remote). A command matches only when its
+  program word (quotes and `VAR=value` prefixes allowed) is a listed path, so
+  `echo /path/tool.sh` still goes remote. Entries must be absolute
   paths: relative paths, bare command names and patterns are rejected. Everything else — including
   a missing or malformed list — routes to the remote as usual.
+- `rah local-cmds [--global | --mount name|path] [show | set [CMD...] | reset]` — command
+  names that run **on this machine** when they are the program word of the command, matched
+  by basename, quotes and `VAR=value` prefixes allowed. Typical entries are CLIs that use the
+  user's own logins, e.g. `gh`, or `codex` so that `codex exec` sub-agents start here. Empty
+  by default. `--global` sets the list for every mount without its own; `set` with no names
+  routes everything remotely.
+  A local-only command later in a remote-bound line (`make && gh pr create`) is refused with
+  a message instead of failing on the remote; run it as a separate command. For a one-off
+  choice, prefix the command with `rah local --` or `rah remote --` instead of changing the list.
 
 ## Local files and other mounts
 
@@ -921,7 +986,8 @@ current project is `/mnt/b`. Replace these example paths with paths from `rah li
 - Use `rah run --cwd /mnt/c -- cat file.txt` to execute on C via SSH from A.
   B does not need connectivity to C. `--cwd` is the mount path on A, not C's native path.
 
-The hook leaves commands starting with `rah` on A; `rah local` runs the given program
+The hook leaves commands starting with `rah` on A (and refuses `rah` later in a line,
+e.g. `ls; rah local -- ...`, since that whole line would go to B); `rah local` runs the given program
 there, while `rah run` connects to the selected remote. Put `rah local` at the start
 of the tool command. It preserves arguments, stdin, output, exit status, and the local
 working directory; `--cwd` changes that directory for this invocation only. If the
@@ -967,6 +1033,10 @@ Put HostName/Port/ProxyJump in `~/.ssh/config` under `Host <alias>`, then run
   executes on the remote.
 - Standalone `cd`/`pushd`/`popd` stays local. Other ordinary commands default to the
   current mount's remote, with the explicit routing exceptions described above.
+- Paths printed by remote commands are remote paths. For file tools, map them back under
+  the mount (`rah list` shows both). A Claude SessionStart hook states the mapping each session.
+- Stopping or timing out a routed command also stops its remote process group. If the ssh
+  connection drops mid-command, rah prints the remote process group and how to stop it.
 RAHSKILL
 }
 
@@ -1151,6 +1221,8 @@ cmd_mount() {
 
   _do_mount "$host" "$remote_path" "$mountpoint" "$socket" "$port" || _die "mount failed (host $host)"
 
+  local local_cmds_line=""
+  grep -q '^local_cmds=' "$cfg" 2>/dev/null && local_cmds_line="$(grep -m1 '^local_cmds=' "$cfg")"
   {
     printf 'host=%s\n'           "$host"
     printf 'remote_path=%s\n'    "$remote_path"
@@ -1159,6 +1231,7 @@ cmd_mount() {
     printf 'control_socket=%s\n' "$socket"
     printf 'ssh_port=%s\n'       "$port"
     printf 'prelude=%s\n'        "$prelude"
+    [ -z "$local_cmds_line" ] || printf '%s\n' "$local_cmds_line"
   } > "$cfg"
   if _systemd_autostart_configured; then
     _systemd_enable_mount_service "$name" || _say_warn "could not enable automatic recovery for $name"
@@ -1325,6 +1398,27 @@ cmd_local() {
   exec -- "$@"
 }
 
+# ---------- remote (explicit one-command route to the current mount's remote) ----------
+
+# The remote counterpart of `rah local`: argv is quoted word by word, so it
+# overrides local_cmds for one command without reparsing (`rah run` joins argv).
+cmd_remote() {
+  local cwd="$PWD" arg q=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd)
+        [ $# -ge 2 ] && [ -n "$2" ] || _die "remote: --cwd requires a directory"
+        cwd="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) _die "usage: rah remote [--cwd DIR] -- <command> [args...]" ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || _die "remote: empty command (usage: rah remote [--cwd DIR] -- <command> [args...])"
+  for arg in "$@"; do q="$q $(_shq "$arg")"; done
+  cmd_run --cwd "$cwd" --b64 "$(printf '%s' "${q# }" | _b64_encode)"
+}
+
 # ---------- run (routing core) ----------
 
 cmd_run() {
@@ -1365,16 +1459,59 @@ cmd_run() {
 
   _ensure_master "$host" "$socket" "$port" 2>/dev/null || true   # self-heal a dead master
 
-  local b64 pre=""
+  local b64 pre="" job
   b64="$(printf '%s' "$cmd" | _b64_encode)"
   [ -n "$prelude" ] && pre="{ $prelude; } && "
+  job="$(date +%s)-$$-$RANDOM"
 
-  local remote="cd $(_shq "$remote_cwd") && ${pre}printf %s $(_shq "$b64") | base64 -d | bash"
+  # Killing the local ssh (an agent stopping or timing out the tool) leaves a
+  # non-tty remote command running. So run it as its own process group and record
+  # the group id in a job file, which _run_remote_job can signal later.
+  local wrapper='d="${TMPDIR:-/tmp}/rah-$(id -u)"; mkdir -p "$d"; f="$d/$1"
+set -m
+bash -c "$(printf %s "$2" | base64 -d)" &
+p=$!
+set +m
+printf "%s\n" "$p" > "$f"
+wait "$p"; rc=$?
+rm -f "$f"
+exit "$rc"'
+  local remote="cd $(_shq "$remote_cwd") && ${pre}exec bash -c $(_shq "$wrapper") rah-run $(_shq "$job") $(_shq "$b64")"
+
   set +e
-  ssh "${ssh_args[@]}" -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -S "$socket" "$host" "$remote"
-  local rc=$?
-  set -e
+  local sp rc
+  trap '_run_remote_job stop; kill "$sp" 2>/dev/null; exit 143' TERM
+  trap '_run_remote_job stop; kill "$sp" 2>/dev/null; exit 130' INT
+  trap '_run_remote_job stop; kill "$sp" 2>/dev/null; exit 129' HUP
+  # Backgrounded so the traps fire at once instead of after ssh exits; the explicit
+  # <&0 keeps stdin, which `&` would otherwise replace with /dev/null.
+  ssh "${ssh_args[@]}" -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -S "$socket" "$host" "$remote" <&0 &
+  sp=$!
+  wait "$sp"; rc=$?
+  trap - TERM INT HUP
+  if [ "$rc" -eq 255 ]; then
+    local pgid
+    if pgid="$(_run_remote_job pgid)"; then
+      [ -n "$pgid" ] && printf 'rah: lost the ssh connection to %s; the command is still running there (process group %s). Stop it with: rah run --cwd %s -- kill -- -%s\n' \
+        "$host" "$pgid" "$(_shq "$cwd")" "$pgid" >&2
+    else
+      printf 'rah: ssh to %s failed (exit 255); if the connection dropped mid-command, the command may still be running there\n' "$host" >&2
+    fi
+  fi
   exit $rc
+}
+
+# `stop`: SIGTERM the process group of cmd_run's remote command. `pgid`: print its
+# group id if it is still running (nothing if it has exited); fails when ssh does.
+# Reads cmd_run's locals (host, socket, ssh_args, job).
+_run_remote_job() {
+  local script
+  case "$1" in
+    stop) script='f="${TMPDIR:-/tmp}/rah-$(id -u)/$1"; [ -f "$f" ] && kill -TERM -- "-$(cat "$f")" 2>/dev/null; rm -f "$f"; exit 0' ;;
+    pgid) script='f="${TMPDIR:-/tmp}/rah-$(id -u)/$1"; [ -f "$f" ] && cat "$f"; exit 0' ;;
+  esac
+  _timeout 8 ssh "${ssh_args[@]}" -o ConnectTimeout=5 -o BatchMode=yes -S "$socket" "$host" \
+    "exec bash -c $(_shq "$script") rah-job $(_shq "$job")" </dev/null 2>/dev/null
 }
 
 # ---------- hook (PreToolUse rewrite; shared by Claude & Codex) ----------
@@ -1452,14 +1589,45 @@ cmd_hook() {
   # Last stop before the command is handed to the remote: a command that invokes a
   # globally whitelisted absolute path stays on this host. Only consulted when the
   # command would otherwise be routed, so nothing outside a managed mount changes.
-  local allow_entry="" action="passthrough"
+  local allow_entry="" action="passthrough" local_cmds="" head
   if [ "$passthrough" -eq 0 ] && [ -n "$cmd" ]; then
+    local_cmds="$(_local_cmds "$cfg")"
+    head="$(_command_head "$cmd")"
     if allow_entry="$(_local_allow_match "$cmd")" && [ -n "$allow_entry" ]; then
       passthrough=1
       reason="local-allow"
       action="local"
+    elif _is_local_cmd "$head" "$local_cmds"; then
+      allow_entry=""
+      passthrough=1
+      reason="local-cmd"
+      action="local"
     else
       allow_entry=""
+    fi
+  fi
+
+  # The first word decides where the whole command line runs, so a local-only
+  # command later in a remote-bound line would fail there with a misleading
+  # "command not found". Refuse it up front and say how to split it.
+  if [ "$passthrough" -eq 0 ] && [ -n "$cmd" ]; then
+    local later msg=""
+    while IFS= read -r later; do
+      case "$later" in
+        rah|*/rah)
+          msg="rah: this command runs on $(_get "$cfg" host) because its first word is not rah; rah only stays on this host as the first word. Run it as a separate command, e.g. rah local -- bash -c '...'" ;;
+        *)
+          _is_local_cmd "$later" "$local_cmds" || continue
+          msg="rah: '${later##*/}' runs on this host only as the first word of a command; this command line goes to $(_get "$cfg" host) because of its first word. Run '${later##*/} ...' as a separate command, or wrap the whole line in rah local -- bash -c '...'" ;;
+      esac
+      break
+    done < <(_later_command_heads "$cmd")
+    if [ -n "$msg" ]; then
+      _hook_log_event "$tool" "$reported_cwd" "$tool_cwd" "$cwd" "$matched" "$cfg" \
+        "refuse" "local-command-not-first" "$decision" "$decision" 1 "$cmd"
+      printf '%s' "$input" | jq -c --arg c "printf '%s\\n' $(_shq "$msg") >&2; exit 2" --arg d "$decision" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,updatedInput:((.tool_input // {}) + {command:$c})}}'
+      return 0
     fi
   fi
 
@@ -1491,6 +1659,71 @@ cmd_hook() {
   # (Monitor's required description/timeout_ms, Bash's run_in_background/timeout).
   printf '%s' "$input" | jq -c --arg c "$newcmd" --arg d "$decision" \
     '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,updatedInput:((.tool_input // {}) + {command:$c})}}'
+}
+
+# SessionStart hook: tell the agent where its tools execute. Its own environment
+# block describes this host, while its commands run on the remote.
+cmd_session_context() {
+  local input cwd cfg host remote mp local_cmds text
+  input="$(cat)"
+  cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+  [ -n "$cwd" ] || cwd="$PWD"
+  cfg="$(_config_for_cwd "$cwd")" || return 0
+  host="$(_get "$cfg" host)"; remote="$(_get "$cfg" remote_path)"; mp="$(_get "$cfg" mountpoint)"
+  local_cmds="$(_local_cmds "$cfg")"
+  text="rah: $mp is an SSHFS mount of $host:$remote.
+- Bash and Monitor commands are routed to $host and run in the matching directory under $remote, with that machine's environment, GPUs and data. Platform, OS and similar details in your environment describe this local machine, not $host. Stopping or timing out a command also stops it on $host."
+  [ "$mp" = "$remote" ] || text="$text
+- Read, Edit, Write, Glob and Grep run on this machine through the mount. Remote commands print paths under $remote; give file tools the same path under $mp instead."
+  [ -z "$local_cmds" ] || text="$text
+- Commands whose first word is one of: $local_cmds run on this machine (configure with: rah local-cmds)."
+  text="$text
+- To choose the host for one command, start it with \`rah local -- <cmd>\` (this machine) or \`rah remote -- <cmd>\` ($host, even for $([ -n "$local_cmds" ] && printf '%s' "$local_cmds" || printf 'local commands')). Arguments pass through unchanged; use \`bash -c '...'\` after \`--\` for pipelines. rah must be the first word; anywhere else the line goes to $host."
+  jq -nc --arg t "$text" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$t}}'
+}
+
+cmd_local_cmds() {
+  local target="" global=0 cfg name c
+  local usage="usage: rah local-cmds [--global | --mount name|path] [show | set [CMD...] | reset]"
+  case "${1:-}" in
+    --global) global=1; shift ;;
+    --mount)
+      [ $# -ge 2 ] || _die "local-cmds: --mount requires a name or path"
+      target="$2"; shift 2 ;;
+  esac
+  local action="${1:-show}"
+  [ $# -gt 0 ] && shift
+  case "$action" in
+    show|reset) ;;
+    set)
+      for c in "$@"; do
+        case "$c" in ""|*[!A-Za-z0-9._+-]*) _die "local-cmds: not a bare command name: $c" ;; esac
+      done ;;
+    *) _die "$usage" ;;
+  esac
+  if [ "$global" -eq 1 ]; then
+    case "$action" in
+      set) mkdir -p "$RAH_CONFIG_DIR"; printf '%s\n' "$*" > "$RAH_LOCAL_CMDS_FILE" ;;
+      reset) rm -f "$RAH_LOCAL_CMDS_FILE" ;;
+    esac
+    local gcmds; gcmds="$(_global_local_cmds)"
+    _say_ok "global local commands: ${gcmds:-none}"
+    _say_note "used by mounts without their own list"
+    return 0
+  fi
+  cfg="$(_cfg_from_arg_or_cwd "$target")" \
+    || _die "local-cmds: no managed mount for ${target:-the current directory} (use --global or --mount <name|path>, see: rah list)"
+  name="$(basename "$cfg" .env)"
+  case "$action" in
+    set) _cfg_set "$cfg" local_cmds "$*" ;;
+    reset) _cfg_unset "$cfg" local_cmds ;;
+  esac
+  local cmds; cmds="$(_local_cmds "$cfg")"
+  if grep -q '^local_cmds=' "$cfg"; then
+    _say_ok "$name: local commands: ${cmds:-none}"
+  else
+    _say_ok "$name: local commands: ${cmds:-none} (global list)"
+  fi
 }
 
 cmd_hook_log() {
@@ -2115,44 +2348,49 @@ _hook_present() {
     "$file" >/dev/null 2>&1
 }
 
-# Add/update our {matcher:"Bash", hooks:[{command:<hc>}]} group in .hooks.PreToolUse, idempotently.
+# Add/update our {matcher, hooks:[{command:<hc>}]} group in .hooks[<event>], idempotently.
+# Our entry is recognised by its command prefix.
 _merge_hook_json() {
-  local file="$1" hc="$2" matcher="$3" tmp; tmp="$(mktemp)"
+  local file="$1" event="$2" prefix="$3" hc="$4" matcher="$5" tmp; tmp="$(mktemp)"
   [ -f "$file" ] || echo '{}' > "$file"
-  jq --arg hc "$hc" --arg matcher "$matcher" '
-    .hooks.PreToolUse = ((.hooks.PreToolUse // [])
-      | map(if ((.hooks // []) | any(.command | startswith("rah hook"))) then
+  jq --arg ev "$event" --arg p "$prefix" --arg hc "$hc" --arg matcher "$matcher" '
+    def ours: (.command // "") | startswith($p);
+    .hooks[$ev] = ((.hooks[$ev] // [])
+      | map(if ((.hooks // []) | any(ours)) then
           .matcher = $matcher
-          | .hooks |= map(if (.command | startswith("rah hook")) then .command = $hc else . end)
+          | .hooks |= map(if ours then .command = $hc else . end)
         else . end)
-      | if any(.[]; (.hooks // []) | any(.command | startswith("rah hook"))) then .
+      | if any(.[]; (.hooks // []) | any(ours)) then .
         else . + [{matcher:$matcher, hooks:[{type:"command", command:$hc}]}] end)
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-# Strip the rah hook entry from .hooks.PreToolUse, dropping any group left empty.
+# Strip our entry (by command prefix) from .hooks[<event>], dropping any group left empty.
 _remove_hook_json() {
-  local file="$1" tmp
+  local file="$1" event="$2" prefix="$3" tmp
   [ -f "$file" ] || return 0
   tmp="$(mktemp)"
-  jq '
-    if (.hooks.PreToolUse | type) == "array" then
-      .hooks.PreToolUse |= ( map(.hooks |= map(select((.command | startswith("rah hook")) | not)))
-                             | map(select((.hooks // [] | length) > 0)) )
+  jq --arg ev "$event" --arg p "$prefix" '
+    if (.hooks[$ev] | type) == "array" then
+      .hooks[$ev] |= ( map(.hooks |= map(select((.command // "") | startswith($p) | not)))
+                       | map(select((.hooks // [] | length) > 0)) )
     else . end
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
+# $8 (optional) is a SessionStart command that tells the agent where its tools run.
 _init_agent() {
-  local label="$1" home="$2" cfg="$3" skilldir="$4" remove="$5" hookcmd="$6" matcher="$7"
+  local label="$1" home="$2" cfg="$3" skilldir="$4" remove="$5" hookcmd="$6" matcher="$7" sessioncmd="${8:-}"
 	  if [ "$remove" -eq 1 ]; then
-	    _remove_hook_json "$cfg"
+	    _remove_hook_json "$cfg" PreToolUse "rah hook"
+	    _remove_hook_json "$cfg" SessionStart "rah session-context"
 	    rm -rf "$skilldir"
 	    _say_ok "removed $label hook + skill"
 	  else
 	    _ensure_path
 	    mkdir -p "$home" "$skilldir"
-	    _merge_hook_json "$cfg" "$hookcmd" "$matcher"
+	    _merge_hook_json "$cfg" PreToolUse "rah hook" "$hookcmd" "$matcher"
+	    [ -z "$sessioncmd" ] || _merge_hook_json "$cfg" SessionStart "rah session-context" "$sessioncmd" ""
 	    _skill_doc > "$skilldir/SKILL.md"
 	    _say_ok "$label hook + skill installed"
 	    _say_note "$home"
@@ -2169,7 +2407,7 @@ cmd_init() {
     esac
   done
   case "$agent" in
-    claude) _init_agent "Claude" "$HOME/.claude" "$HOME/.claude/settings.json" "$HOME/.claude/skills/rah" "$remove" "rah hook --decision allow" "$RAH_CLAUDE_MATCHER" ;;
+    claude) _init_agent "Claude" "$HOME/.claude" "$HOME/.claude/settings.json" "$HOME/.claude/skills/rah" "$remove" "rah hook --decision allow" "$RAH_CLAUDE_MATCHER" "rah session-context" ;;
     codex)  _init_agent "Codex"  "$HOME/.codex"  "$HOME/.codex/hooks.json"     "$HOME/.codex/skills/rah"  "$remove" "rah hook --decision allow --passthrough empty" "Bash|command_execution" ;;
     *)      _die "usage: rah init <claude|codex> [--remove]" ;;
   esac
@@ -2733,8 +2971,10 @@ cmd_uninstall() {
     name="$(basename "$cfg" .env)"
     cmd_unmount "$name" 2>/dev/null || true
 	  done < <(_list_configs)
-	  _remove_hook_json "$HOME/.claude/settings.json"; rm -rf "$HOME/.claude/skills/rah"
-	  _remove_hook_json "$HOME/.codex/hooks.json";     rm -rf "$HOME/.codex/skills/rah"
+	  _remove_hook_json "$HOME/.claude/settings.json" PreToolUse "rah hook"
+	  _remove_hook_json "$HOME/.claude/settings.json" SessionStart "rah session-context"
+	  rm -rf "$HOME/.claude/skills/rah"
+	  _remove_hook_json "$HOME/.codex/hooks.json" PreToolUse "rah hook"; rm -rf "$HOME/.codex/skills/rah"
 	  _say_ok "removed hooks + skills from ~/.claude and ~/.codex"
 	  [ -e "$RAH_BIN_DIR/rah" ] && { rm -f "$RAH_BIN_DIR/rah"; _say_ok "removed $RAH_BIN_DIR/rah"; }
 	  if [ "$purge" -eq 1 ]; then
@@ -2760,11 +3000,15 @@ rah — Remote as Host (v$RAH_VERSION)
   rah remove [--keep-local] [name|path]                      unmount + remove config; rmdir empty mountpoint
   rah autostart on|off|status                                restore managed mounts after reboot/login
   rah local [--cwd DIR] -- <command> [args...]                execute once on the local agent host
+  rah remote [--cwd DIR] -- <command> [args...]               execute once on the current mount's remote
   rah run --cwd <dir> -- <cmd...>                            execute a command on the remote
   rah hook [--decision defer|allow|ask] [--passthrough defer|empty]
                                                                 PreToolUse rewrite (reads JSON on stdin)
   rah hook-log on [path] | off | status | clear [path]       enable/inspect hook diagnostics
   rah local-allow list | add <abs-path> | remove <abs-path>  keep tools at these absolute paths running locally
+  rah local-cmds [--global | --mount name|path] [show | set [CMD...] | reset]
+                                                               commands run locally by first word (empty by default)
+  rah session-context                                        SessionStart hook: tell the agent where tools run
   rah init <claude|codex> [--remove]                         install/remove hook + skill for an agent
   rah status [--all|--current] [name|path] | list            show mount / ssh / exec / agent-hook health
   rah verify [name|path]                                     end-to-end mount/ssh/hook check
@@ -2785,9 +3029,12 @@ main() {
     remove|rm)   cmd_remove "$@" ;;
     autostart)   cmd_autostart "$@" ;;
     local)       cmd_local "$@" ;;
+    remote)      cmd_remote "$@" ;;
     run)         cmd_run "$@" ;;
     hook)        cmd_hook "$@" ;;
     hook-log)    cmd_hook_log "$@" ;;
+    session-context) cmd_session_context "$@" ;;
+    local-cmds)  cmd_local_cmds "$@" ;;
     local-allow) cmd_local_allow "$@" ;;
     init)        cmd_init "$@" ;;
     status|list) cmd_status "$@" ;;
