@@ -1042,6 +1042,14 @@ _do_mount() {
   # Give the file plane its own SSH transport. A multiplexed connection can
   # inherit a master's stale session/keepalives and couples unrelated mounts.
   opts="BatchMode=yes,ConnectTimeout=8,ConnectionAttempts=1,ServerAliveInterval=5,ServerAliveCountMax=3,follow_symlinks,ControlMaster=no,ControlPath=none"
+  # sshfs caches attributes and listings for 20s by default, so after a remote
+  # command an agent's file tools see old sizes (reads cut short) and miss new
+  # files. 1s keeps them fresh at agent pace; Grep/Glob speed was unchanged.
+  # sshfs 2.x (common with macFUSE) names the option cache_timeout.
+  case "$("$sshfs_bin" --version 2>&1)" in
+    *"SSHFS version 2."*) opts="$opts,cache_timeout=1" ;;
+    *)                    opts="$opts,dcache_timeout=1" ;;
+  esac
   # systemd owns reconnection: let sshfs exit on disconnect so pending I/O
   # fails promptly and the service restarts. Manual/macOS mounts self-reconnect.
   [ "$foreground" = 1 ] || opts="reconnect,$opts"
