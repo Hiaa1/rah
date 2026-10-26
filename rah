@@ -14,6 +14,8 @@ RAH_MOUNT_ROOT="${RAH_MOUNT_ROOT:-$HOME/mnt_rah}"
 RAH_HOOK_LOG_DEFAULT="$RAH_CONFIG_DIR/hook.jsonl"
 RAH_HOOK_LOG_FLAG="$RAH_CONFIG_DIR/hook-log"
 RAH_LOCAL_ALLOW_FILE="$RAH_CONFIG_DIR/local-allow"
+# Claude tools that run a shell command and must be routed to the remote.
+RAH_CLAUDE_MATCHER="Bash|Monitor"
 # A whitelist is a handful of paths; anything larger is a corrupt or wrong file,
 # and scanning it would stall every Bash tool call.
 RAH_LOCAL_ALLOW_MAX_BYTES=65536
@@ -1485,8 +1487,10 @@ cmd_hook() {
   esac
   _hook_log_event "$tool" "$reported_cwd" "$tool_cwd" "$cwd" "$matched" "$cfg" \
     "route" "managed-mount" "$decision" "$decision" 1 "$cmd"
-  jq -nc --arg c "$newcmd" --arg d "$decision" \
-    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,updatedInput:{command:$c}}}'
+  # updatedInput replaces the whole tool input, so keep the other fields
+  # (Monitor's required description/timeout_ms, Bash's run_in_background/timeout).
+  printf '%s' "$input" | jq -c --arg c "$newcmd" --arg d "$decision" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,updatedInput:((.tool_input // {}) + {command:$c})}}'
 }
 
 cmd_hook_log() {
@@ -2165,7 +2169,7 @@ cmd_init() {
     esac
   done
   case "$agent" in
-    claude) _init_agent "Claude" "$HOME/.claude" "$HOME/.claude/settings.json" "$HOME/.claude/skills/rah" "$remove" "rah hook --decision allow" "Bash" ;;
+    claude) _init_agent "Claude" "$HOME/.claude" "$HOME/.claude/settings.json" "$HOME/.claude/skills/rah" "$remove" "rah hook --decision allow" "$RAH_CLAUDE_MATCHER" ;;
     codex)  _init_agent "Codex"  "$HOME/.codex"  "$HOME/.codex/hooks.json"     "$HOME/.codex/skills/rah"  "$remove" "rah hook --decision allow --passthrough empty" "Bash|command_execution" ;;
     *)      _die "usage: rah init <claude|codex> [--remove]" ;;
   esac
@@ -2545,7 +2549,7 @@ cmd_status() (
 
   if [ "$show_agents" -eq 1 ]; then
     _say_header "Agents"
-    _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" || true
+    _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "$RAH_CLAUDE_MATCHER" || true
     _agent_hook_status "codex" "$HOME/.codex/hooks.json" "rah hook --decision allow --passthrough empty" "Bash|command_execution" || true
     printf '  %-10s ' "hook-log"
     if _hook_log_path >/dev/null 2>&1; then
@@ -2622,7 +2626,7 @@ cmd_verify() {
   if [ -z "$hook_out" ]; then _tag_ok "ok"; printf '\n'; else _tag_fail "FAILED"; printf ' Codex passthrough was not empty\n'; ok=0; fi
 
   printf '  claude:     '
-  if _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "Bash" >/dev/null; then
+  if _agent_hook_status "claude" "$HOME/.claude/settings.json" "rah hook --decision allow" "$RAH_CLAUDE_MATCHER" >/dev/null; then
     _tag_ok "hook installed"; printf '\n'
   else
     _tag_warn "not ready"; printf ' run: rah init claude\n'

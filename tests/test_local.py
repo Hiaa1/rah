@@ -106,6 +106,20 @@ class LocalExecutionTests(unittest.TestCase):
         self.assertIn(shlex.quote(str(self.mount)), rewritten)
         self.assertFalse((self.config / "local-allow").exists())
 
+    def test_hook_rewrite_keeps_other_tool_input_fields(self):
+        tool_input = {"command": "tail -f log", "description": "watch log",
+                      "timeout_ms": 60000, "run_in_background": True}
+        result = self.run_rah(
+            "hook", "--decision", "allow",
+            input=json.dumps({"tool_name": "Monitor", "cwd": str(self.mount),
+                              "tool_input": tool_input}),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
+        self.assertTrue(updated.pop("command").startswith("rah run --cwd "))
+        tool_input.pop("command")
+        self.assertEqual(updated, tool_input)
+
 
 if __name__ == "__main__":
     unittest.main()
