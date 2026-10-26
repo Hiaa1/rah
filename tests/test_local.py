@@ -106,6 +106,58 @@ class LocalExecutionTests(unittest.TestCase):
         self.assertIn(shlex.quote(str(self.mount)), rewritten)
         self.assertFalse((self.config / "local-allow").exists())
 
+    def rewritten(self, command):
+        result = self.hook(command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        if not result.stdout:
+            return None
+        return json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+
+    def test_local_cmds_route_by_program_word(self):
+        self.assertTrue(self.rewritten("gh pr list").startswith("rah run --cwd "))
+        self.assertEqual(self.run_rah("local-cmds", "--global", "set", "gh", "codex", "tool.sh").returncode, 0)
+        for command in ["gh pr list", "GH_PAGER=cat gh pr view 3", "env gh auth status",
+                        "/usr/bin/gh repo view", 'codex exec "review this"',
+                        '"/opt/my tools/codex" exec x', "'/plugins/1.2/tool.sh' q",
+                        "X=1 /plugins/1.3/tool.sh q"]:
+            with self.subTest(command=command):
+                self.assertIsNone(self.rewritten(command))
+        self.assertTrue(self.rewritten("git status").startswith("rah run --cwd "))
+        self.assertEqual(self.run_rah("local-cmds", "set", "git").returncode, 0)
+        self.assertIsNone(self.rewritten("git status"))
+        self.assertTrue(self.rewritten("gh pr list").startswith("rah run --cwd "))
+        self.assertEqual(self.run_rah("local-cmds", "set").returncode, 0)
+        self.assertTrue(self.rewritten("git status").startswith("rah run --cwd "))
+        self.assertEqual(self.run_rah("local-cmds", "reset").returncode, 0)
+        self.assertIsNone(self.rewritten("gh pr list"))
+        self.assertEqual(self.run_rah("local-cmds", "--global", "reset").returncode, 0)
+        self.assertTrue(self.rewritten("gh pr list").startswith("rah run --cwd "))
+
+    def test_local_command_later_in_remote_line_is_refused(self):
+        self.assertEqual(self.run_rah("local-cmds", "--global", "set", "gh").returncode, 0)
+        for command in ["git push && gh pr create", "ls; rah local -- hostname",
+                        "make |\nrah local -- cat x"]:
+            with self.subTest(command=command):
+                rewritten = self.rewritten(command)
+                result = subprocess.run(["bash", "-c", rewritten], text=True,
+                                        capture_output=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("first word", result.stderr)
+        for command in ['echo "a b" | grep gh', "cd sub && make"]:
+            with self.subTest(command=command):
+                self.assertTrue(self.rewritten(command).startswith("rah run --cwd "))
+
+    def test_session_context_describes_routing(self):
+        self.assertEqual(self.run_rah("local-cmds", "--global", "set", "gh").returncode, 0)
+        result = self.run_rah("session-context", input=json.dumps({"cwd": str(self.mount)}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"{self.mount} is an SSHFS mount of unused.invalid:/remote/project", context)
+        self.assertIn("first word is one of: gh", context)
+        result = self.run_rah("session-context", input=json.dumps({"cwd": str(self.root)}))
+        self.assertEqual((result.returncode, result.stdout), (0, ""))
+
     def test_hook_rewrite_keeps_other_tool_input_fields(self):
         tool_input = {"command": "tail -f log", "description": "watch log",
                       "timeout_ms": 60000, "run_in_background": True}

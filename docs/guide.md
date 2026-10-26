@@ -17,16 +17,18 @@ Configuration, command routing, and recovery for an agent host connected to remo
 | `rah remove [--keep-local] [name\|path]` | Remove a mount's configuration; normally also remove its empty local directory. |
 | `rah autostart on\|off\|status` | Manage recovery after boot or login. |
 | `rah local [--cwd DIR] -- <command> [args...]` | Execute one command on the agent host. |
+| `rah remote [--cwd DIR] -- <command> [args...]` | Execute one command on the current mount's remote, even if it is in `local-cmds`. |
 | `rah run --cwd <local-mount-path> -- <command...>` | Execute on the remote associated with the specified mount. |
 | `rah init <claude\|codex> [--remove]` | Install or remove the routing hook and skill. |
 | `rah local-allow list\|add\|remove <absolute-path>` | Manage local executable exceptions. |
+| `rah local-cmds [--global\|--mount name\|path] [show\|set [CMD...]\|reset]` | Choose commands that run locally by program name, globally or per mount. Empty by default. |
 | `rah hook-log on\|off\|status\|clear` | Manage logging of routing decisions. |
 | `rah doctor` | Check local dependencies and managed mounts. |
 | `rah version` | Print the version of the installed executable. |
 | `rah self-update` | Update a downloaded installation. |
 | `rah uninstall [--purge]` | Remove rah integration and the binary; optionally remove configuration. |
 
-`rah hook` is the integration entry point used by the agents. It is not a command you normally need to invoke yourself.
+`rah hook` and `rah session-context` are integration entry points used by the agents. You do not normally invoke them yourself.
 
 ## Installation and updates
 
@@ -165,7 +167,7 @@ rah local -- diff /mnt/b/config.yaml /mnt/c/config.yaml
 rah run --cwd /mnt/c -- cat file.txt
 ```
 
-The hook leaves commands beginning with `rah` on A. B does not need SSH access to C. Put `rah local` at the start of the agent's tool command.
+The hook leaves commands beginning with `rah` on A. B does not need SSH access to C. Put `rah local` at the start of the agent's tool command. A `rah` later in the line (`ls; rah local -- ...`) is refused with a message, because that whole line would go to B.
 
 `rah local` preserves arguments, standard streams, and exit status. Its working directory stays local; relative paths inside `/mnt/b` still access B's mounted files. Use `--cwd` or absolute paths to select another directory. For a pipeline or redirection, pass the whole script to a local shell:
 
@@ -183,7 +185,36 @@ rah local-allow list
 rah local-allow remove /home/you/bin/local-helper.sh
 ```
 
-The global file is `~/.config/rah/local-allow`, with one absolute path per line. A command must start with an entry and match a word boundary. `echo /home/you/bin/local-helper.sh` still routes remotely. Relative paths, bare command names, and patterns are rejected. Missing or malformed entries do not broaden local execution.
+The global file is `~/.config/rah/local-allow`, with one absolute path per line. A command matches when its program word equals an entry; quotes and `VAR=value` prefixes are allowed. `echo /home/you/bin/local-helper.sh` still routes remotely. Relative paths, bare command names, and patterns are rejected. Missing or malformed entries do not broaden local execution.
+
+### Local commands by name
+
+Some tools belong to the agent host whichever project is open. `gh` needs your GitHub login. Agent CLIs such as `codex` need your own accounts and configuration, so a `codex exec` sub-agent should start on A, not on the remote. A command runs on A when its program word is in the local command list. rah skips `env` and `VAR=value` prefixes, strips quotes, and matches by basename, so `"/any/path/tool.sh" ...` matches `tool.sh`. The list is empty by default. `--global` sets it for every mount without its own list.
+
+```bash
+rah local-cmds                 # show the list for the current mount
+rah local-cmds --global set gh codex   # for all mounts
+rah local-cmds set gh git      # also run git on A for this mount
+rah local-cmds set             # route everything to the remote
+rah local-cmds --mount NAME reset   # back to the global list
+```
+
+For a single command, choose the host with a prefix instead of changing the list. Both keep arguments as given:
+
+```bash
+rah local -- git push          # this time on A
+rah remote -- gh auth status   # this time on the remote, despite local_cmds
+```
+
+The list is stored as `local_cmds=` in the mount's config. Usually `git` should stay remote: repository hooks then use the remote environment, and large trees avoid SSHFS. If a listed command appears later in a remote-bound line, as in `make && gh pr create`, the hook refuses that line and explains how to split it, instead of letting the remote fail with `command not found`.
+
+### What the agent is told
+
+`rah init claude` also installs a `SessionStart` hook (`rah session-context`). In a managed mount, it tells Claude which host runs its commands and how remote paths map to mount paths. It also lists the commands that stay local and explains how to use `rah local`. Claude's own environment block describes the agent host, so without this hint it tends to pass remote paths to its file tools.
+
+### Stopping remote commands
+
+`rah run` starts the remote command in its own process group. When the agent stops or kills a routed command, which sends SIGTERM to the local `ssh`, rah signals that whole remote group, so training jobs and their workers do not keep running unseen. If the SSH connection drops with exit 255, rah checks whether the command is still alive. If it is, rah prints its process group and the command that stops it.
 
 ## Recovery and troubleshooting
 
